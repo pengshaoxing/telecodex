@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct CodexThreadSummary {
@@ -21,7 +22,7 @@ pub struct CodexThreadSummary {
 pub struct CodexEnvironmentSummary {
     pub cwd: PathBuf,
     pub name: String,
-    pub latest_thread_id: String,
+    pub latest_thread_id: Option<String>,
     pub updated_at: String,
 }
 
@@ -162,8 +163,9 @@ pub fn list_environments_for_sources(
     limit: usize,
     import_desktop: bool,
     import_cli: bool,
+    seed_workspaces: &[PathBuf],
 ) -> Result<Vec<CodexEnvironmentSummary>> {
-    list_environments_filtered(codex_home, limit, |source| match source {
+    list_environments_filtered(codex_home, limit, seed_workspaces, |source| match source {
         CodexHistorySource::Desktop => import_desktop,
         CodexHistorySource::Cli => import_cli,
         CodexHistorySource::Unknown => import_desktop || import_cli,
@@ -173,6 +175,7 @@ pub fn list_environments_for_sources(
 fn list_environments_filtered<F>(
     codex_home: &Path,
     limit: usize,
+    seed_workspaces: &[PathBuf],
     mut allow_source: F,
 ) -> Result<Vec<CodexEnvironmentSummary>>
 where
@@ -187,7 +190,7 @@ where
         let candidate = CodexEnvironmentSummary {
             cwd: environment_cwd.clone(),
             name: environment_name_for_cwd(&environment_cwd, &thread.title),
-            latest_thread_id: thread.id.clone(),
+            latest_thread_id: Some(thread.id.clone()),
             updated_at: thread.updated_at.clone(),
         };
         match environments.get(&environment_cwd) {
@@ -196,6 +199,23 @@ where
                 environments.insert(environment_cwd, candidate);
             }
         }
+    }
+    for workspace in seed_workspaces {
+        let environment_cwd = environment_identity_for_cwd(workspace);
+        environments
+            .entry(environment_cwd.clone())
+            .or_insert_with(|| CodexEnvironmentSummary {
+                cwd: environment_cwd.clone(),
+                name: environment_name_for_cwd(
+                    &environment_cwd,
+                    workspace
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("Workspace"),
+                ),
+                latest_thread_id: None,
+                updated_at: String::new(),
+            });
     }
     let mut items = environments.into_values().collect::<Vec<_>>();
     items.sort_by(|left, right| {
@@ -208,6 +228,19 @@ where
         items.truncate(limit);
     }
     Ok(items)
+}
+
+pub fn environment_selector_key(environment: &CodexEnvironmentSummary) -> String {
+    match environment.latest_thread_id.as_deref() {
+        Some(thread_id) => format!("thread:{thread_id}"),
+        None => format!(
+            "cwd:{}",
+            Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                environment.cwd.to_string_lossy().as_bytes()
+            )
+        ),
+    }
 }
 
 fn list_all_threads(codex_home: &Path) -> Result<Vec<CodexThreadSummary>> {
@@ -866,13 +899,16 @@ mod tests {
         )
         .unwrap();
 
-        let cli_only = list_environments_for_sources(dir.path(), 10, false, true).unwrap();
+        let cli_only = list_environments_for_sources(dir.path(), 10, false, true, &[]).unwrap();
         assert_eq!(cli_only.len(), 1);
-        assert_eq!(cli_only[0].latest_thread_id, "cli-1");
+        assert_eq!(cli_only[0].latest_thread_id, Some("cli-1".to_string()));
 
-        let desktop_only = list_environments_for_sources(dir.path(), 10, true, false).unwrap();
+        let desktop_only = list_environments_for_sources(dir.path(), 10, true, false, &[]).unwrap();
         assert_eq!(desktop_only.len(), 1);
-        assert_eq!(desktop_only[0].latest_thread_id, "desktop-1");
+        assert_eq!(
+            desktop_only[0].latest_thread_id,
+            Some("desktop-1".to_string())
+        );
     }
 
     #[test]
@@ -898,8 +934,32 @@ mod tests {
         )
         .unwrap();
 
-        let environments = list_environments_for_sources(dir.path(), 10, true, false).unwrap();
+        let environments = list_environments_for_sources(dir.path(), 10, true, false, &[]).unwrap();
         assert_eq!(environments[0].name, "Journal");
+    }
+
+    #[test]
+    fn includes_seed_workspaces_without_history() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(workspace.join(".codex").join("environments")).unwrap();
+        fs::write(
+            workspace
+                .join(".codex")
+                .join("environments")
+                .join("environment.toml"),
+            "version = 1\nname = \"Seeded\"\n",
+        )
+        .unwrap();
+
+        let environments =
+            list_environments_for_sources(dir.path(), 10, false, false, &[workspace.clone()])
+                .unwrap();
+
+        assert_eq!(environments.len(), 1);
+        assert_eq!(environments[0].cwd, normalize_path(workspace));
+        assert_eq!(environments[0].name, "Seeded");
+        assert_eq!(environments[0].latest_thread_id, None);
     }
 
     #[test]
