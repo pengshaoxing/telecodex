@@ -125,10 +125,9 @@ pub(super) async fn process_turn(
     cancel.cancel();
     let _ = chat_action_task.await;
     let final_result = async {
-        shared.store.set_session_busy(session.key, false)?;
-
         match run_result {
             Ok(summary) => {
+                shared.store.set_session_busy(session.key, false)?;
                 let sink_for_success = sink.clone();
                 let sink_for_failure = sink.clone();
                 finalize_foreground_turn(
@@ -171,10 +170,12 @@ pub(super) async fn process_turn(
                                 "failed to clear stale session conversation for {:?}: {clear_error:#}",
                                 session.key
                             );
+                            shared.store.set_session_busy(session.key, false)?;
                             None
                         }
                     }
                 } else {
+                    shared.store.set_session_busy(session.key, false)?;
                     None
                 };
                 finish_failed_turn(&shared.store, turn_id, &sink, status, &error, recovery_note)
