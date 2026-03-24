@@ -111,6 +111,30 @@ pub(super) async fn process_turn(
                             .await?;
                             Ok(CodexEventOutcome::Approval(decision))
                         }
+                        CodexEvent::UserInputRequest(request) => {
+                            if let Err(error) = sink
+                                .lock()
+                                .await
+                                .set_progress("Waiting for user input...")
+                                .await
+                            {
+                                tracing::debug!(
+                                    "failed to update user input progress for {:?}: {error:#}",
+                                    session_key
+                                );
+                            }
+                            let answers = request_telegram_user_input(
+                                shared,
+                                session_key.chat_id,
+                                Some(session_key.thread_id).filter(|value| *value != 0),
+                                session_key,
+                                requester_user_id,
+                                request,
+                                cancel,
+                            )
+                            .await?;
+                            Ok(CodexEventOutcome::UserInput(answers))
+                        }
                         other => {
                             sink.lock().await.handle_event(other).await?;
                             Ok(CodexEventOutcome::None)
@@ -366,6 +390,12 @@ impl LiveTurnSink {
             CodexEvent::ApprovalRequest(request) => {
                 if !self.has_assistant_text {
                     self.pending_text = approval_waiting_text(request.kind);
+                }
+            }
+            CodexEvent::UserInputRequest(_) => {
+                if !self.has_assistant_text {
+                    self.pending_text =
+                        "⏳ Waiting for your input in Telegram...".to_string();
                 }
             }
         }

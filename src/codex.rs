@@ -46,6 +46,7 @@ pub enum CodexEvent {
     AssistantText(String),
     ThreadStarted(String),
     ApprovalRequest(CodexApprovalRequest),
+    UserInputRequest(UserInputRequest),
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +54,20 @@ pub struct CodexApprovalRequest {
     pub kind: CodexApprovalKind,
     pub prompt: String,
     pub options: Vec<CodexApprovalDecision>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserInputRequest {
+    pub prompt: String,
+    pub fields: Vec<UserInputField>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserInputField {
+    pub name: String,
+    pub label: String,
+    pub options: Vec<String>,
+    pub required: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,10 +84,11 @@ pub enum CodexApprovalDecision {
     Cancel,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexEventOutcome {
     None,
     Approval(CodexApprovalDecision),
+    UserInput(serde_json::Value),
 }
 #[derive(Debug, Clone)]
 pub struct CommandSpec {
@@ -555,11 +571,13 @@ where
                 .await?;
         }
         "item/tool/requestUserInput" => {
-            process.send_result(id, json!({"answers":{}})).await?;
-            let _ = on_event(CodexEvent::Progress(
-                "Tool requested user input, but Telegram replies are not wired yet.".to_string(),
-            ))
-            .await?;
+            let request = build_user_input_request(params);
+            let outcome = on_event(CodexEvent::UserInputRequest(request)).await?;
+            let answers = match outcome {
+                CodexEventOutcome::UserInput(answers) => answers,
+                _ => Value::Object(serde_json::Map::new()),
+            };
+            process.send_result(id, json!({"answers": answers})).await?;
         }
         _ => {
             bail!("unsupported app-server server request `{method}`");
@@ -614,7 +632,7 @@ where
     loop {
         tokio::select! {
           _=cancel.cancelled()=>{terminate_child(&mut child).await; let _=stderr_task.await; bail!("codex turn cancelled");}
-          next_line=stdout_lines.next_line()=>{match next_line.context("reading codex stdout failed")?{Some(line)=>{if let Some(event)=parse_exec_event(&line)?{match &event{CodexEvent::ThreadStarted(thread_id)=>summary.codex_thread_id=Some(thread_id.clone()),CodexEvent::AssistantText(text)=>summary.assistant_text=text.clone(),CodexEvent::Progress(_)|CodexEvent::ApprovalRequest(_)=>{}} let _ = on_event(event).await?;}},None=>break,}}
+          next_line=stdout_lines.next_line()=>{match next_line.context("reading codex stdout failed")?{Some(line)=>{if let Some(event)=parse_exec_event(&line)?{match &event{CodexEvent::ThreadStarted(thread_id)=>summary.codex_thread_id=Some(thread_id.clone()),CodexEvent::AssistantText(text)=>summary.assistant_text=text.clone(),CodexEvent::Progress(_)|CodexEvent::ApprovalRequest(_)|CodexEvent::UserInputRequest(_)=>{}} let _ = on_event(event).await?;}},None=>break,}}
         }
     }
     let status = child.wait().await.context("waiting for codex failed")?;
@@ -889,6 +907,59 @@ fn strip_ansi_codes(input: &str) -> String {
     clean
 }
 
+fn build_user_input_request(params: &Value) -> UserInputRequest {
+    let payload = approval_request_payload(params);
+    let prompt = payload
+        .get("prompt")
+        .or_else(|| payload.get("question"))
+        .or_else(|| params.get("prompt"))
+        .and_then(Value::as_str)
+        .unwrap_or("Please provide input")
+        .to_string();
+    let fields = payload
+        .get("fields")
+        .or_else(|| params.get("fields"))
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(parse_input_field).collect())
+        .unwrap_or_else(|| {
+            vec![UserInputField {
+                name: "input".to_string(),
+                label: prompt.clone(),
+                options: vec![],
+                required: true,
+            }]
+        });
+    UserInputRequest { prompt, fields }
+}
+
+fn parse_input_field(value: &Value) -> Option<UserInputField> {
+    let name = value.get("name")?.as_str()?.to_string();
+    let label = value
+        .get("label")
+        .or_else(|| value.get("description"))
+        .and_then(Value::as_str)
+        .unwrap_or(&name)
+        .to_string();
+    let options = value
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|o| {
+                    o.as_str().map(String::from)
+                        .or_else(|| o.get("label").and_then(Value::as_str).map(String::from))
+                        .or_else(|| o.get("value").and_then(Value::as_str).map(String::from))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let required = value
+        .get("required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Some(UserInputField { name, label, options, required })
+}
+
 fn build_command_approval_request(params: &Value) -> CodexApprovalRequest {
     let payload = approval_request_payload(params);
     let command = payload
@@ -1017,7 +1088,7 @@ fn approval_decision_value(decision: CodexApprovalDecision) -> &'static str {
 fn outcome_to_approval_decision(outcome: CodexEventOutcome) -> CodexApprovalDecision {
     match outcome {
         CodexEventOutcome::Approval(decision) => decision,
-        CodexEventOutcome::None => CodexApprovalDecision::Decline,
+        CodexEventOutcome::None | CodexEventOutcome::UserInput(_) => CodexApprovalDecision::Decline,
     }
 }
 

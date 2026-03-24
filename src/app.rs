@@ -76,6 +76,8 @@ struct AppShared {
     session_defaults: SessionDefaults,
     limits_cache: Mutex<Option<CachedLimitsSnapshot>>,
     pending_approvals: Mutex<HashMap<String, PendingApproval>>,
+    pending_user_inputs: Mutex<HashMap<String, PendingUserInput>>,
+    pending_text_inputs: Mutex<HashMap<SessionKey, PendingTextInput>>,
     pending_codex_login: Mutex<Option<PendingCodexLogin>>,
     codex_login_backoff_until: Mutex<Option<Instant>>,
 }
@@ -101,6 +103,16 @@ struct CachedLimitsSnapshot {
 struct PendingApproval {
     requester_user_id: i64,
     responder: oneshot::Sender<CodexApprovalDecision>,
+}
+
+struct PendingUserInput {
+    requester_user_id: i64,
+    responder: oneshot::Sender<serde_json::Value>,
+}
+
+struct PendingTextInput {
+    token: String,
+    field_name: String,
 }
 
 struct TurnWorkspace {
@@ -137,6 +149,8 @@ impl App {
                 session_defaults,
                 limits_cache: Mutex::new(None),
                 pending_approvals: Mutex::new(HashMap::new()),
+                pending_user_inputs: Mutex::new(HashMap::new()),
+                pending_text_inputs: Mutex::new(HashMap::new()),
                 pending_codex_login: Mutex::new(None),
                 codex_login_backoff_until: Mutex::new(None),
             }),
@@ -259,6 +273,52 @@ impl App {
         }
         let session_key = SessionKey::new(message.chat.id, message.message_thread_id);
 
+        // Intercept message as answer to a pending free-text user input request
+        if !text.is_empty() {
+            let pending_text = self
+                .shared
+                .pending_text_inputs
+                .lock()
+                .await
+                .remove(&session_key);
+            if let Some(pending_text) = pending_text {
+                let pending_input = self
+                    .shared
+                    .pending_user_inputs
+                    .lock()
+                    .await
+                    .remove(&pending_text.token);
+                if let Some(pending_input) = pending_input {
+                    if pending_input.requester_user_id == from.id
+                        || user.role == UserRole::Admin
+                    {
+                        let answers =
+                            serde_json::json!({ pending_text.field_name: text });
+                        let _ = pending_input.responder.send(answers);
+                        self.send_status(
+                            message.chat.id,
+                            message.message_thread_id,
+                            "Answer received.",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    // Requester mismatch — restore both so the request stays live
+                    self.shared
+                        .pending_user_inputs
+                        .lock()
+                        .await
+                        .insert(pending_text.token.clone(), pending_input);
+                    self.shared
+                        .pending_text_inputs
+                        .lock()
+                        .await
+                        .insert(session_key, pending_text);
+                }
+                // pending_input already timed out — fall through as normal turn
+            }
+        }
+
         if is_primary_forum_dashboard(
             &self.shared.config,
             &message.chat,
@@ -367,6 +427,35 @@ impl App {
                     )
                     .await?;
                 }
+            }
+            return Ok(());
+        }
+        if let Some((token, field_name, answer)) = parse_user_input_callback_data(&data) {
+            let pending = {
+                let mut inputs = self.shared.pending_user_inputs.lock().await;
+                match inputs.remove(&token) {
+                    Some(pending)
+                        if pending.requester_user_id == callback.from.id
+                            || user.role == UserRole::Admin =>
+                    {
+                        Some(pending)
+                    }
+                    Some(pending) => {
+                        inputs.insert(token.clone(), pending);
+                        None
+                    }
+                    None => None,
+                }
+            };
+            if let Some(pending) = pending {
+                let answers = serde_json::json!({ field_name: answer });
+                let _ = pending.responder.send(answers);
+                self.send_status(
+                    message.chat.id,
+                    message.message_thread_id,
+                    &format!("Selected: **{}**", answer),
+                )
+                .await?;
             }
             return Ok(());
         }
