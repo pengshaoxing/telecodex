@@ -98,7 +98,13 @@ struct EnvironmentToml {
 }
 
 pub fn latest_thread_for_cwd(codex_home: &Path, cwd: &Path) -> Result<Option<CodexThreadSummary>> {
-    Ok(list_threads_for_cwd(codex_home, cwd, 1)?.into_iter().next())
+    let result = list_threads_for_cwd(codex_home, cwd, 1)?.into_iter().next();
+    tracing::debug!(
+        "codex_history: latest thread for cwd={}: {}",
+        cwd.display(),
+        result.as_ref().map(|t| t.id.as_str()).unwrap_or("none"),
+    );
+    Ok(result)
 }
 
 pub fn environment_identity_for_cwd(cwd: &Path) -> PathBuf {
@@ -154,6 +160,12 @@ pub fn list_threads_for_cwd(
     let target_cwd = environment_identity_for_cwd(cwd);
     let mut summaries = list_all_threads(codex_home)?;
     summaries.retain(|summary| environment_identity_for_cwd(&summary.cwd) == target_cwd);
+    tracing::debug!(
+        "codex_history: found {} threads for cwd={} (limit={})",
+        summaries.len(),
+        cwd.display(),
+        limit,
+    );
     if limit > 0 && summaries.len() > limit {
         summaries.truncate(limit);
     }
@@ -167,11 +179,17 @@ pub fn list_environments_for_sources(
     import_cli: bool,
     seed_workspaces: &[PathBuf],
 ) -> Result<Vec<CodexEnvironmentSummary>> {
-    list_environments_filtered(codex_home, limit, seed_workspaces, |source| match source {
+    tracing::debug!(
+        "codex_history: listing environments (desktop={import_desktop}, cli={import_cli}, seeds={})",
+        seed_workspaces.len(),
+    );
+    let result = list_environments_filtered(codex_home, limit, seed_workspaces, |source| match source {
         CodexHistorySource::Desktop => import_desktop,
         CodexHistorySource::Cli => import_cli,
         CodexHistorySource::Unknown => import_desktop || import_cli,
-    })
+    })?;
+    tracing::debug!("codex_history: found {} environments", result.len());
+    Ok(result)
 }
 
 fn list_environments_filtered<F>(

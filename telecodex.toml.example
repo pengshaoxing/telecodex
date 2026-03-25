@@ -4,6 +4,7 @@ poll_timeout_seconds = 30
 edit_debounce_ms = 900
 max_text_chunk = 3500
 tmp_dir = "/absolute/path/to/telecodex/tmp"
+log_file = "telecodex.log"
 
 [telegram]
 bot_token_env = "TELEGRAM_BOT_TOKEN"
@@ -29,3 +30,13 @@ seed_workspaces = ["/absolute/path/to/workspace-a"]
 default_add_dirs = [
   "/absolute/path/to/workspace"
 ]
+
+# Optional: remote Whisper-compatible speech-to-text API
+# Uncomment to enable voice message transcription via API
+# [whisper]
+# api_base = "https://api.siliconflow.cn/v1"
+# api_key_env = "WHISPER_API_KEY"
+# model = "FunAudioLLM/SenseVoiceSmall"
+# language = "zh"
+# initial_prompt = "Telecodex, Codex, Telegram, Rust, Python"
+# timeout_seconds = 60

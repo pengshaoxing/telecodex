@@ -22,6 +22,7 @@ impl TelegramClient {
     }
 
     pub async fn get_me(&self) -> Result<User> {
+        tracing::debug!("telegram: getMe");
         self.post::<(), User>("getMe", None).await
     }
 
@@ -86,6 +87,17 @@ impl TelegramClient {
 
     pub async fn edit_message_text(&self, request: EditMessageText) -> Result<Message> {
         self.post("editMessageText", Some(&request)).await
+    }
+
+    pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<bool> {
+        #[derive(Serialize)]
+        struct Payload {
+            chat_id: i64,
+            message_id: i64,
+        }
+
+        self.post("deleteMessage", Some(&Payload { chat_id, message_id }))
+            .await
     }
 
     pub async fn answer_callback_query(&self, callback_query_id: &str) -> Result<bool> {
@@ -281,6 +293,7 @@ impl TelegramClient {
     }
 
     pub async fn download_file(&self, file_path: &str) -> Result<Vec<u8>> {
+        tracing::debug!("telegram: downloading file {file_path}");
         let url = format!("{}/file/bot{}/{}", self.api_base, self.token, file_path);
         let response = self
             .http
@@ -290,6 +303,7 @@ impl TelegramClient {
             .context("telegram getFile download failed")?;
         let status = response.status();
         if !status.is_success() {
+            tracing::warn!("telegram: file download failed with status {status}, path={file_path}");
             bail!("telegram file download failed with status {status}");
         }
         Ok(response.bytes().await?.to_vec())
@@ -306,6 +320,7 @@ impl TelegramClient {
             request = request.json(payload);
         }
 
+        tracing::debug!("telegram: calling {method}");
         let response = request
             .send()
             .await
@@ -317,9 +332,13 @@ impl TelegramClient {
             .with_context(|| format!("telegram {method} response body failed"))?;
 
         if !status.is_success() {
+            tracing::warn!("telegram: {method} failed with status {status}");
             let parsed = serde_json::from_str::<ApiResponse<R>>(&body).ok();
             if let Some(parsed) = parsed {
                 if let Some(parameters) = parsed.parameters {
+                    if let Some(retry) = parameters.retry_after {
+                        tracing::warn!("telegram: {method} rate-limited, retry_after={retry}s");
+                    }
                     return Err(TelegramError {
                         status,
                         description: parsed
@@ -391,6 +410,7 @@ impl TelegramClient {
             form = form.text("message_thread_id", thread_id.to_string());
         }
 
+        tracing::debug!("telegram: uploading {file_field} via {method} for chat {chat_id}, file={file_name}");
         let response = self
             .http
             .post(url)
@@ -405,6 +425,7 @@ impl TelegramClient {
             .with_context(|| format!("telegram {method} response body failed"))?;
 
         if !status.is_success() {
+            tracing::warn!("telegram: {method} upload failed with status {status}");
             let parsed = serde_json::from_str::<ApiResponse<Message>>(&body).ok();
             if let Some(parsed) = parsed {
                 if let Some(parameters) = parsed.parameters {

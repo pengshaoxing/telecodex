@@ -71,9 +71,11 @@ const UNSUPPORTED_COMMANDS: &[&str] = &[
 
 pub fn parse_command(command: &str, args: &str, original_text: &str) -> Result<ParsedInput> {
     if FORWARDED_COMMANDS.contains(&command) {
+        tracing::debug!("command: forwarding {command} to codex");
         return Ok(ParsedInput::Forward(original_text.trim().to_string()));
     }
     if UNSUPPORTED_COMMANDS.contains(&command) {
+        tracing::debug!("command: rejecting unsupported {command}");
         return Ok(ParsedInput::Bridge(BridgeCommand::Unsupported {
             command: command.to_string(),
         }));
@@ -146,8 +148,12 @@ pub fn parse_command(command: &str, args: &str, original_text: &str) -> Result<P
         "/copy" => BridgeCommand::Copy,
         "/clear" => BridgeCommand::Clear,
         "/restart_bot" => BridgeCommand::RestartBot,
-        _ => return Ok(ParsedInput::Forward(original_text.trim().to_string())),
+        _ => {
+            tracing::debug!("command: unknown {command}, forwarding as text");
+            return Ok(ParsedInput::Forward(original_text.trim().to_string()));
+        }
     };
+    tracing::debug!("command: parsed bridge command {command}");
     Ok(ParsedInput::Bridge(bridge))
 }
 

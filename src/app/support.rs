@@ -289,10 +289,7 @@ pub(super) fn auto_search_mode_for_prompt(prompt: &str) -> Option<crate::config:
         "today",
         "news",
         "latest",
-        "last 24 hours",
-        "today",
         "current",
-        "news",
     ]
     .iter()
     .any(|needle| prompt.contains(needle));

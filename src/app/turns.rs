@@ -7,6 +7,7 @@ use uuid::Uuid;
 pub(super) async fn process_turn(
     shared: Arc<AppShared>,
     cancel_slot: Arc<StdMutex<Option<CancellationToken>>>,
+    server: &mut Option<crate::codex::SessionAppServer>,
     queued: QueuedTurn,
 ) -> Result<()> {
     let session = shared.store.ensure_session(
@@ -21,6 +22,11 @@ pub(super) async fn process_turn(
         .record_turn_started(session.id, &queued.request)?;
     let turn_workspace = prepare_turn_workspace(&session, turn_id)?;
 
+    tracing::info!(
+        "turn started for {:?}, cwd={}",
+        session.key,
+        session.cwd.display()
+    );
     let cancel = CancellationToken::new();
     *cancel_slot.lock().expect("cancel mutex poisoned") = Some(cancel.clone());
     let chat_action_task = spawn_chat_action_task(
@@ -76,7 +82,7 @@ pub(super) async fn process_turn(
 
     let run_result = shared
         .codex
-        .run_turn(&session, &runtime_request, cancel.clone(), {
+        .run_turn_with_server(server, &session, &runtime_request, cancel.clone(), {
             let sink = sink.clone();
             let shared = shared.clone();
             let approval_cancel = cancel.clone();
@@ -111,6 +117,30 @@ pub(super) async fn process_turn(
                             .await?;
                             Ok(CodexEventOutcome::Approval(decision))
                         }
+                        CodexEvent::UserInputRequest(request) => {
+                            if let Err(error) = sink
+                                .lock()
+                                .await
+                                .set_progress("Waiting for user input...")
+                                .await
+                            {
+                                tracing::debug!(
+                                    "failed to update user input progress for {:?}: {error:#}",
+                                    session_key
+                                );
+                            }
+                            let answers = request_telegram_user_input(
+                                shared,
+                                session_key.chat_id,
+                                Some(session_key.thread_id).filter(|value| *value != 0),
+                                session_key,
+                                requester_user_id,
+                                request,
+                                cancel,
+                            )
+                            .await?;
+                            Ok(CodexEventOutcome::UserInput(answers))
+                        }
                         other => {
                             sink.lock().await.handle_event(other).await?;
                             Ok(CodexEventOutcome::None)
@@ -127,6 +157,11 @@ pub(super) async fn process_turn(
     let final_result = async {
         match run_result {
             Ok(summary) => {
+                tracing::info!(
+                    "turn completed for {:?}, text={}chars",
+                    session.key,
+                    summary.assistant_text.len()
+                );
                 shared.store.set_session_busy(session.key, false)?;
                 let sink_for_success = sink.clone();
                 let sink_for_failure = sink.clone();
@@ -140,6 +175,8 @@ pub(super) async fn process_turn(
                         },
                         || async {
                             send_generated_artifacts(&shared, &session, &turn_workspace.out_dir)
+                                .await?;
+                            send_inline_file_references(&shared, &session, &summary.assistant_text)
                                 .await
                         },
                         || async move { sink_for_success.lock().await.finish(None).await },
@@ -160,6 +197,10 @@ pub(super) async fn process_turn(
                         "resetting stale Codex thread binding for {:?} after error: {error:#}",
                         session.key
                     );
+                    // Discard persistent process — its thread context is stale
+                    if let Some(s) = server.take() {
+                        let _ = s.shutdown().await;
+                    }
                     match shared.store.clear_session_conversation(session.key) {
                         Ok(()) => Some(
                             "The saved Codex thread binding for this topic was reset. Retry the same request to start a fresh session."
@@ -368,6 +409,12 @@ impl LiveTurnSink {
                     self.pending_text = approval_waiting_text(request.kind);
                 }
             }
+            CodexEvent::UserInputRequest(_) => {
+                if !self.has_assistant_text {
+                    self.pending_text =
+                        "⏳ Waiting for your input in Telegram...".to_string();
+                }
+            }
         }
         self.flush(false).await
     }
@@ -419,13 +466,20 @@ impl LiveTurnSink {
             return Ok(());
         }
 
-        let chunks = if force {
-            split_text(&visible_text, self.shared.config.max_text_chunk)
-        } else {
-            vec![truncate_for_live_update(
-                &visible_text,
+        let all_chunks = split_text(&visible_text, self.shared.config.max_text_chunk);
+        // During streaming (force=false), grow messages incrementally: allow at most
+        // one new message per flush so the user sees content appear progressively.
+        // On finish (force=true), emit all chunks at once.
+        let chunks = if !force && all_chunks.len() > self.messages.len() + 1 {
+            let mut limited = all_chunks[..self.messages.len()].to_vec();
+            let remainder: String = all_chunks[self.messages.len()..].join("");
+            limited.push(truncate_for_live_update(
+                &remainder,
                 self.shared.config.max_text_chunk,
-            )]
+            ));
+            limited
+        } else {
+            all_chunks
         };
         for (idx, chunk) in chunks.iter().enumerate() {
             let html = render_markdown_to_html(chunk);
@@ -445,7 +499,25 @@ impl LiveTurnSink {
                     chat_id: self.session_key.chat_id,
                     message_id: message.message_id,
                 };
+                tracing::debug!(
+                    "new telegram message #{} for {:?}",
+                    self.messages.len(),
+                    self.session_key
+                );
                 self.messages.push(reference);
+            }
+        }
+        // On finish, remove any extra messages left over from streaming
+        // (e.g. if the final text is shorter than intermediate updates).
+        if force {
+            while self.messages.len() > chunks.len() {
+                if let Some(extra) = self.messages.pop() {
+                    let _ = self
+                        .shared
+                        .telegram
+                        .delete_message(extra.chat_id, extra.message_id)
+                        .await;
+                }
             }
         }
 
@@ -455,14 +527,15 @@ impl LiveTurnSink {
     }
 
     fn visible_text(&self, force: bool) -> String {
+        let text = strip_telegram_file_tags(&self.pending_text);
         if force {
-            return self.pending_text.clone();
+            return text;
         }
         match self.limits_inline.as_deref() {
             Some(limits_inline) if !limits_inline.is_empty() => {
-                format!("{limits_inline}\n{}", self.pending_text)
+                format!("{limits_inline}\n{text}")
             }
-            _ => self.pending_text.clone(),
+            _ => text,
         }
     }
 
@@ -565,9 +638,11 @@ async fn enrich_audio_transcripts(
     workspace: &TurnWorkspace,
     sink: &Arc<Mutex<LiveTurnSink>>,
 ) {
-    let Some(model_dir) = shared.handy_model_dir.clone() else {
+    let use_remote = shared.whisper_config.is_some();
+    let use_local = shared.handy_model_dir.is_some();
+    if !use_remote && !use_local {
         return;
-    };
+    }
 
     let total = request
         .attachments
@@ -595,22 +670,29 @@ async fn enrich_audio_transcripts(
         })
         .enumerate()
     {
-        let label = format!(
-            "Transcribing audio {}/{} with Handy model...",
-            idx + 1,
-            total
-        );
+        let label = if use_remote {
+            format!("Transcribing audio {}/{} via Whisper API...", idx + 1, total)
+        } else {
+            format!("Transcribing audio {}/{} with Handy model...", idx + 1, total)
+        };
         if let Err(error) = sink.lock().await.set_progress(label).await {
             tracing::debug!("failed to update transcription progress: {error:#}");
         }
 
-        match transcribe_audio_file(
-            model_dir.clone(),
-            attachment.path.clone(),
-            workspace.root.clone(),
-        )
-        .await
-        {
+        let result = if let Some(whisper) = &shared.whisper_config {
+            transcribe_audio_remote(&shared.http_client, whisper, &attachment.path).await
+        } else if let Some(model_dir) = &shared.handy_model_dir {
+            transcribe_audio_file(
+                model_dir.clone(),
+                attachment.path.clone(),
+                workspace.root.clone(),
+            )
+            .await
+        } else {
+            continue;
+        };
+
+        match result {
             Ok(transcript) => {
                 attachment.transcript = Some(transcript);
             }
@@ -715,6 +797,13 @@ pub(super) fn prepare_runtime_request(
         "If you generate final deliverable files for the user, save only the final files in this directory:\n{}\nKeep intermediate scratch files outside this directory.",
         workspace.out_dir.display()
     ));
+
+    instruction_sections.push(
+        "To send an existing file to the user via Telegram, include a tag in your response: <telegramFile>relative/or/absolute/path</telegramFile>\n\
+         The bridge will automatically upload the file. Use relative paths (resolved from cwd) or absolute paths. \
+         You can include multiple tags for multiple files. The tags will be stripped from the displayed message."
+            .to_string(),
+    );
 
     let mut runtime_request = request.clone();
     runtime_request.prompt = user_prompt_sections.join("\n\n");
@@ -941,6 +1030,87 @@ async fn send_generated_artifacts(
                     )
                     .await?;
             }
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_inline_file_references(
+    shared: &Arc<AppShared>,
+    session: &crate::models::SessionRecord,
+    assistant_text: &str,
+) -> Result<()> {
+    let paths = extract_telegram_file_paths(assistant_text);
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let cwd = session.cwd.canonicalize().unwrap_or_else(|_| session.cwd.clone());
+
+    for raw_path in paths.iter().take(10) {
+        let file_path = if Path::new(raw_path).is_absolute() {
+            PathBuf::from(raw_path)
+        } else {
+            session.cwd.join(raw_path)
+        };
+        let file_path = file_path.canonicalize().unwrap_or(file_path);
+
+        // Security: must be within session cwd
+        if !file_path.starts_with(&cwd) {
+            tracing::warn!(
+                "telegramFile path outside cwd, skipping: {}",
+                file_path.display()
+            );
+            continue;
+        }
+        if !file_path.is_file() {
+            tracing::warn!(
+                "telegramFile path not found or not a file: {}",
+                file_path.display()
+            );
+            continue;
+        }
+        // Check file size (Telegram limit: 50MB for documents)
+        if let Ok(metadata) = fs::metadata(&file_path) {
+            if metadata.len() > 50 * 1024 * 1024 {
+                tracing::warn!(
+                    "telegramFile too large ({}MB), skipping: {}",
+                    metadata.len() / 1024 / 1024,
+                    file_path.display()
+                );
+                continue;
+            }
+        }
+
+        let file_name = file_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let mime_type = mime_type_for_path(&file_path);
+        tracing::info!("sending inline file reference: {}", file_path.display());
+
+        let _ = shared
+            .telegram
+            .send_chat_action(
+                session.key.chat_id,
+                Some(session.key.thread_id).filter(|value| *value != 0),
+                ChatAction::UploadDocument,
+            )
+            .await;
+        if let Err(error) = shared
+            .telegram
+            .send_document(
+                session.key.chat_id,
+                Some(session.key.thread_id).filter(|value| *value != 0),
+                &file_path,
+                &file_name,
+                mime_type.as_deref(),
+            )
+            .await
+        {
+            tracing::warn!("failed to send inline file {}: {error:#}", file_path.display());
         }
     }
 

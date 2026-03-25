@@ -28,7 +28,7 @@ mod turns;
 use crate::{
     codex::{
         AvailableModel, CodexApprovalDecision, CodexApprovalKind, CodexEvent, CodexEventOutcome,
-        CodexRunner,
+        CodexRunner, SessionAppServer,
     },
     codex_history::{
         CodexEnvironmentSummary, CodexHistoryEntry, CodexThreadSummary,
@@ -47,14 +47,15 @@ use crate::{
     models::{
         AttachmentKind, LocalAttachment, SessionKey, TelegramMessageRef, TurnRequest, UserRole,
     },
-    render::{render_markdown_to_html, split_text},
+    render::{extract_telegram_file_paths, render_markdown_to_html, split_text, strip_telegram_file_tags},
     store::{SessionDefaults, Store},
     telegram::{
         ChatAction, EditMessageText, InlineKeyboardButton, InlineKeyboardMarkup, Message,
         SendMessage, TelegramClient, TelegramError, is_foreign_bot_command, normalize_command,
         preferred_image_file_id,
     },
-    transcribe::{detect_handy_parakeet_model_dir, transcribe_audio_file},
+    config::WhisperConfig,
+    transcribe::{detect_handy_parakeet_model_dir, transcribe_audio_file, transcribe_audio_remote},
 };
 
 use self::{auth::*, presentation::*, support::*, turns::*};
@@ -73,16 +74,25 @@ struct AppShared {
     bot_username: Option<String>,
     service_user_id: i64,
     handy_model_dir: Option<PathBuf>,
+    whisper_config: Option<WhisperConfig>,
+    http_client: reqwest::Client,
     session_defaults: SessionDefaults,
     limits_cache: Mutex<Option<CachedLimitsSnapshot>>,
     pending_approvals: Mutex<HashMap<String, PendingApproval>>,
+    pending_user_inputs: Mutex<HashMap<String, PendingUserInput>>,
+    pending_text_inputs: Mutex<HashMap<SessionKey, PendingTextInput>>,
     pending_codex_login: Mutex<Option<PendingCodexLogin>>,
     codex_login_backoff_until: Mutex<Option<Instant>>,
 }
 
+enum WorkerMessage {
+    Turn(QueuedTurn),
+    InvalidateProcess,
+}
+
 #[derive(Clone)]
 struct SessionWorkerHandle {
-    sender: mpsc::UnboundedSender<QueuedTurn>,
+    sender: mpsc::UnboundedSender<WorkerMessage>,
     cancel: Arc<StdMutex<Option<CancellationToken>>>,
 }
 
@@ -101,6 +111,16 @@ struct CachedLimitsSnapshot {
 struct PendingApproval {
     requester_user_id: i64,
     responder: oneshot::Sender<CodexApprovalDecision>,
+}
+
+struct PendingUserInput {
+    requester_user_id: i64,
+    responder: oneshot::Sender<serde_json::Value>,
+}
+
+struct PendingTextInput {
+    token: String,
+    field_name: String,
 }
 
 struct TurnWorkspace {
@@ -124,6 +144,7 @@ impl App {
         )?;
         let codex = CodexRunner::new(config.codex.binary.clone());
         let service_user_id = config.startup_admin_ids.first().copied().unwrap_or(0);
+        let whisper_config = config.whisper.clone();
 
         Ok(Self {
             shared: Arc::new(AppShared {
@@ -134,9 +155,13 @@ impl App {
                 bot_username: me.username,
                 service_user_id,
                 handy_model_dir,
+                whisper_config,
+                http_client: reqwest::Client::new(),
                 session_defaults,
                 limits_cache: Mutex::new(None),
                 pending_approvals: Mutex::new(HashMap::new()),
+                pending_user_inputs: Mutex::new(HashMap::new()),
+                pending_text_inputs: Mutex::new(HashMap::new()),
                 pending_codex_login: Mutex::new(None),
                 codex_login_backoff_until: Mutex::new(None),
             }),
@@ -178,6 +203,9 @@ impl App {
                     .get_updates(offset, self.shared.config.poll_timeout_seconds) => {
                     match result {
                         Ok(updates) => {
+                            if !updates.is_empty() {
+                                tracing::debug!("received {} update(s)", updates.len());
+                            }
                             for update in updates {
                                 offset = Some(update.update_id + 1);
                                 self.shared.store.save_last_update_id(update.update_id)?;
@@ -258,6 +286,52 @@ impl App {
             return Ok(());
         }
         let session_key = SessionKey::new(message.chat.id, message.message_thread_id);
+
+        // Intercept message as answer to a pending free-text user input request
+        if !text.is_empty() {
+            let pending_text = self
+                .shared
+                .pending_text_inputs
+                .lock()
+                .await
+                .remove(&session_key);
+            if let Some(pending_text) = pending_text {
+                let pending_input = self
+                    .shared
+                    .pending_user_inputs
+                    .lock()
+                    .await
+                    .remove(&pending_text.token);
+                if let Some(pending_input) = pending_input {
+                    if pending_input.requester_user_id == from.id
+                        || user.role == UserRole::Admin
+                    {
+                        let answers =
+                            serde_json::json!({ pending_text.field_name: text });
+                        let _ = pending_input.responder.send(answers);
+                        self.send_status(
+                            message.chat.id,
+                            message.message_thread_id,
+                            "Answer received.",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    // Requester mismatch — restore both so the request stays live
+                    self.shared
+                        .pending_user_inputs
+                        .lock()
+                        .await
+                        .insert(pending_text.token.clone(), pending_input);
+                    self.shared
+                        .pending_text_inputs
+                        .lock()
+                        .await
+                        .insert(session_key, pending_text);
+                }
+                // pending_input already timed out — fall through as normal turn
+            }
+        }
 
         if is_primary_forum_dashboard(
             &self.shared.config,
@@ -367,6 +441,35 @@ impl App {
                     )
                     .await?;
                 }
+            }
+            return Ok(());
+        }
+        if let Some((token, field_name, answer)) = parse_user_input_callback_data(&data) {
+            let pending = {
+                let mut inputs = self.shared.pending_user_inputs.lock().await;
+                match inputs.remove(&token) {
+                    Some(pending)
+                        if pending.requester_user_id == callback.from.id
+                            || user.role == UserRole::Admin =>
+                    {
+                        Some(pending)
+                    }
+                    Some(pending) => {
+                        inputs.insert(token.clone(), pending);
+                        None
+                    }
+                    None => None,
+                }
+            };
+            if let Some(pending) = pending {
+                let answers = serde_json::json!({ field_name: answer });
+                let _ = pending.responder.send(answers);
+                self.send_status(
+                    message.chat.id,
+                    message.message_thread_id,
+                    &format!("Selected: **{}**", answer),
+                )
+                .await?;
             }
             return Ok(());
         }
@@ -584,6 +687,7 @@ impl App {
                     let path = validate_directory(&path)?;
                     self.ensure_session(session_key, user.tg_user_id)?;
                     self.shared.store.set_session_cwd(session_key, &path)?;
+                    self.invalidate_session_process(session_key).await;
                     self.shared.store.audit(
                         Some(user.tg_user_id),
                         "session_cd",
@@ -1033,6 +1137,7 @@ impl App {
                 BridgeCommand::Clear => {
                     self.ensure_session(session_key, user.tg_user_id)?;
                     self.shared.store.clear_session_conversation(session_key)?;
+                    self.invalidate_session_process(session_key).await;
                     self.send_status(
                         message.chat.id,
                         message.message_thread_id,
@@ -1099,6 +1204,7 @@ impl App {
         let session_key = SessionKey::new(message.chat.id, message.message_thread_id);
         let session = self.ensure_session(session_key, user.tg_user_id)?;
         self.shared.store.clear_session_conversation(session_key)?;
+        self.invalidate_session_process(session_key).await;
         if let Some(title) = title
             .as_deref()
             .map(str::trim)
@@ -1288,12 +1394,18 @@ impl App {
         let handle = self.worker_for(request.session_key).await?;
         handle
             .sender
-            .send(QueuedTurn {
+            .send(WorkerMessage::Turn(QueuedTurn {
                 request,
                 chat_kind: chat_kind.to_string(),
-            })
+            }))
             .map_err(|_| anyhow!("session worker dropped"))?;
         Ok(())
+    }
+
+    async fn invalidate_session_process(&self, key: SessionKey) {
+        if let Some(handle) = self.workers.lock().await.get(&key).cloned() {
+            let _ = handle.sender.send(WorkerMessage::InvalidateProcess);
+        }
     }
 
     async fn worker_for(&self, key: SessionKey) -> Result<SessionWorkerHandle> {
@@ -1301,7 +1413,7 @@ impl App {
             return Ok(existing);
         }
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<QueuedTurn>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<WorkerMessage>();
         let cancel = Arc::new(StdMutex::new(None));
         let handle = SessionWorkerHandle {
             sender: tx.clone(),
@@ -1311,10 +1423,39 @@ impl App {
 
         let shared = self.shared.clone();
         tokio::spawn(async move {
-            while let Some(turn) = rx.recv().await {
-                if let Err(error) = process_turn(shared.clone(), cancel.clone(), turn).await {
-                    tracing::error!("turn failed for {:?}: {error:#}", key);
+            let mut server: Option<SessionAppServer> = None;
+            const IDLE_PROCESS_TIMEOUT: Duration = Duration::from_secs(300);
+            loop {
+                match tokio::time::timeout(IDLE_PROCESS_TIMEOUT, rx.recv()).await {
+                    Ok(Some(WorkerMessage::Turn(turn))) => {
+                        if let Err(error) =
+                            process_turn(shared.clone(), cancel.clone(), &mut server, turn).await
+                        {
+                            tracing::error!("turn failed for {:?}: {error:#}", key);
+                        }
+                    }
+                    Ok(Some(WorkerMessage::InvalidateProcess)) => {
+                        if let Some(s) = server.take() {
+                            tracing::info!("invalidating app-server for {:?}", key);
+                            let _ = s.shutdown().await;
+                        }
+                    }
+                    Ok(None) => break, // channel closed, worker exits
+                    Err(_) => {
+                        // Idle timeout: shut down process to free resources
+                        if let Some(s) = server.take() {
+                            tracing::info!(
+                                "idle timeout: shutting down app-server for {:?}",
+                                key
+                            );
+                            let _ = s.shutdown().await;
+                        }
+                    }
                 }
+            }
+            // Worker exiting: clean up any live process
+            if let Some(s) = server.take() {
+                let _ = s.shutdown().await;
             }
         });
 

@@ -1,4 +1,27 @@
+use regex::Regex;
+use std::sync::LazyLock;
+
 use html_escape::encode_safe;
+
+static TELEGRAM_FILE_TAG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<telegramFile>\s*(.*?)\s*</telegramFile>").expect("invalid telegramFile regex")
+});
+
+/// Extract file paths from `<telegramFile>path</telegramFile>` tags.
+pub fn extract_telegram_file_paths(text: &str) -> Vec<String> {
+    TELEGRAM_FILE_TAG
+        .captures_iter(text)
+        .filter_map(|cap| {
+            let path = cap.get(1)?.as_str().trim().to_string();
+            if path.is_empty() { None } else { Some(path) }
+        })
+        .collect()
+}
+
+/// Strip `<telegramFile>...</telegramFile>` tags from text, leaving clean content.
+pub fn strip_telegram_file_tags(text: &str) -> String {
+    TELEGRAM_FILE_TAG.replace_all(text, "").to_string()
+}
 
 pub fn render_markdown_to_html(input: &str) -> String {
     let mut output = String::new();
@@ -192,5 +215,26 @@ mod tests {
     fn splits_large_text() {
         let parts = split_text(&"a".repeat(20), 7);
         assert_eq!(parts.len(), 3);
+    }
+
+    #[test]
+    fn extracts_telegram_file_paths() {
+        let text = "Here is the file:\n<telegramFile>/tmp/foo.txt</telegramFile>\nDone.";
+        let paths = extract_telegram_file_paths(text);
+        assert_eq!(paths, vec!["/tmp/foo.txt"]);
+    }
+
+    #[test]
+    fn extracts_multiple_file_paths() {
+        let text = "<telegramFile>a.rs</telegramFile> and <telegramFile>b.rs</telegramFile>";
+        let paths = extract_telegram_file_paths(text);
+        assert_eq!(paths, vec!["a.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn strips_telegram_file_tags() {
+        let text = "Before\n<telegramFile>/tmp/foo.txt</telegramFile>\nAfter";
+        let stripped = strip_telegram_file_tags(text);
+        assert_eq!(stripped, "Before\n\nAfter");
     }
 }

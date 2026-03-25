@@ -21,6 +21,34 @@ pub struct Config {
     #[serde(default = "default_max_text_chunk")]
     pub max_text_chunk: usize,
     pub tmp_dir: Option<PathBuf>,
+    pub log_file: Option<PathBuf>,
+    pub whisper: Option<WhisperConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WhisperConfig {
+    pub api_base: String,
+    pub api_key_env: Option<String>,
+    pub api_key: Option<String>,
+    #[serde(default = "default_whisper_model")]
+    pub model: String,
+    pub initial_prompt: Option<String>,
+    pub language: Option<String>,
+    #[serde(default = "default_whisper_timeout")]
+    pub timeout_seconds: u64,
+}
+
+impl WhisperConfig {
+    pub fn resolve_api_key(&self) -> Option<String> {
+        if let Some(env_var) = &self.api_key_env {
+            if let Ok(value) = std::env::var(env_var) {
+                if !value.is_empty() {
+                    return Some(value);
+                }
+            }
+        }
+        self.api_key.clone()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,11 +137,18 @@ impl Default for SearchMode {
 
 impl Config {
     pub fn load(path: PathBuf) -> Result<Self> {
+        tracing::info!("loading config from {}", path.display());
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
         let mut config: Config = toml::from_str(&raw)
             .with_context(|| format!("failed to parse config {}", path.display()))?;
         config.validate()?;
+        tracing::info!(
+            "config loaded: db={}, codex_binary={}, default_cwd={}",
+            config.db_path.display(),
+            config.codex.binary.display(),
+            config.codex.default_cwd.display(),
+        );
         Ok(config)
     }
 
@@ -197,6 +232,13 @@ impl Config {
         }
         self.codex.binary = resolve_binary_path(&self.codex.binary)?;
 
+        if let Some(whisper) = &self.whisper {
+            tracing::info!("whisper configured: api_base={}, model={}", whisper.api_base, whisper.model);
+        }
+        if let Some(log_file) = &self.log_file {
+            tracing::debug!("log_file configured: {}", log_file.display());
+        }
+
         Ok(())
     }
 }
@@ -256,6 +298,14 @@ fn default_approval() -> String {
 
 fn default_search_mode() -> SearchMode {
     SearchMode::Disabled
+}
+
+fn default_whisper_model() -> String {
+    "whisper-1".to_string()
+}
+
+fn default_whisper_timeout() -> u64 {
+    60
 }
 
 fn resolve_binary_path(input: &Path) -> Result<PathBuf> {

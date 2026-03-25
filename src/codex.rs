@@ -46,6 +46,7 @@ pub enum CodexEvent {
     AssistantText(String),
     ThreadStarted(String),
     ApprovalRequest(CodexApprovalRequest),
+    UserInputRequest(UserInputRequest),
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +54,21 @@ pub struct CodexApprovalRequest {
     pub kind: CodexApprovalKind,
     pub prompt: String,
     pub options: Vec<CodexApprovalDecision>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserInputRequest {
+    pub prompt: String,
+    pub fields: Vec<UserInputField>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserInputField {
+    pub name: String,
+    pub label: String,
+    pub options: Vec<String>,
+    #[allow(dead_code)]
+    pub required: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,10 +85,11 @@ pub enum CodexApprovalDecision {
     Cancel,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexEventOutcome {
     None,
     Approval(CodexApprovalDecision),
+    UserInput(serde_json::Value),
 }
 #[derive(Debug, Clone)]
 pub struct CommandSpec {
@@ -80,6 +97,33 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub current_dir: Option<PathBuf>,
 }
+pub(crate) struct SessionAppServer {
+    process: AppServerProcess,
+}
+
+impl SessionAppServer {
+    async fn spawn_and_init(
+        binary: &Path,
+        session: &SessionRecord,
+        request: &TurnRequest,
+    ) -> Result<(Self, String)> {
+        tracing::info!("spawning codex app-server for {:?}", session.key);
+        let mut process = AppServerProcess::spawn(binary).await?;
+        process.initialize().await?;
+        let thread_id = process.start_or_resume_thread(session, request).await?;
+        Ok((Self { process }, thread_id))
+    }
+
+    fn is_alive(&mut self) -> bool {
+        matches!(self.process.child.try_wait(), Ok(None))
+    }
+
+    pub(crate) async fn shutdown(self) -> Result<String> {
+        tracing::info!("shutting down persistent codex app-server");
+        self.process.shutdown().await
+    }
+}
+
 struct AppServerProcess {
     child: Child,
     stdin: ChildStdin,
@@ -255,8 +299,9 @@ impl CodexRunner {
         }
         Ok(models)
     }
-    pub async fn run_turn<F, Fut>(
+    pub async fn run_turn_with_server<F, Fut>(
         &self,
+        server: &mut Option<SessionAppServer>,
         session: &SessionRecord,
         request: &TurnRequest,
         cancel: CancellationToken,
@@ -266,10 +311,50 @@ impl CodexRunner {
         F: FnMut(CodexEvent) -> Fut,
         Fut: std::future::Future<Output = Result<CodexEventOutcome>>,
     {
+        // Review mode uses a separate subprocess, not app-server
         if let Some(spec) = self.build_review_command(session, request) {
             return run_review_turn(spec, cancel, on_event).await;
         }
-        run_app_server_turn(&self.binary, session, request, cancel, &mut on_event).await
+
+        // Get or create the persistent app-server process
+        let alive = server.as_mut().map_or(false, |s| s.is_alive());
+        if server.is_some() && !alive {
+            tracing::warn!("codex app-server process died, respawning");
+            let old = server.take().expect("checked Some");
+            let _ = old.shutdown().await;
+        }
+        let thread_id = if server.is_none() {
+            // Fresh spawn: initialize + start/resume thread
+            let (new_server, thread_id) =
+                SessionAppServer::spawn_and_init(&self.binary, session, request).await?;
+            *server = Some(new_server);
+            thread_id
+        } else {
+            // Reuse existing process: just start/resume thread for this turn
+            tracing::debug!("reusing existing codex app-server");
+            let s = server.as_mut().expect("server exists");
+            s.process.start_or_resume_thread(session, request).await?
+        };
+
+        let s = server.as_mut().expect("server just set");
+        let (result, process_ok) = run_turn_on_process(
+            &mut s.process,
+            &thread_id,
+            session,
+            request,
+            cancel,
+            &mut on_event,
+        )
+        .await?;
+
+        if !process_ok {
+            tracing::warn!("codex app-server no longer usable after turn, discarding");
+            if let Some(old) = server.take() {
+                let _ = old.shutdown().await;
+            }
+        }
+
+        Ok(result)
     }
 }
 
@@ -348,30 +433,28 @@ impl CodexDeviceAuthSession {
     }
 }
 
-async fn run_app_server_turn<F, Fut>(
-    binary: &Path,
+/// Core event loop for a single turn. Returns (summary, process_still_usable).
+async fn run_turn_on_process<F, Fut>(
+    process: &mut AppServerProcess,
+    thread_id: &str,
     session: &SessionRecord,
     request: &TurnRequest,
     cancel: CancellationToken,
     on_event: &mut F,
-) -> Result<RunSummary>
+) -> Result<(RunSummary, bool)>
 where
     F: FnMut(CodexEvent) -> Fut,
     Fut: std::future::Future<Output = Result<CodexEventOutcome>>,
 {
-    let mut process = AppServerProcess::spawn(binary).await?;
-    process.initialize().await?;
-    let thread_id = process.start_or_resume_thread(session, request).await?;
     let mut summary = RunSummary {
-        codex_thread_id: Some(thread_id.clone()),
+        codex_thread_id: Some(thread_id.to_string()),
         assistant_text: String::new(),
         stderr_text: String::new(),
     };
-    let _ = on_event(CodexEvent::ThreadStarted(thread_id.clone())).await?;
     let turn_request_id = process
         .send_request(
             "turn/start",
-            build_turn_start_params(&thread_id, session, request),
+            build_turn_start_params(thread_id, session, request),
         )
         .await?;
     let mut active_turn_id: Option<String> = None;
@@ -380,33 +463,33 @@ where
     let mut turn_error: Option<String> = None;
     let mut cancelled = false;
     let mut turn_completed = false;
+    let mut process_ok = true;
     while !turn_completed {
         tokio::select! {
           _=cancel.cancelled(), if !interrupt_sent => {
             if let Some(turn_id)=active_turn_id.as_deref(){process.send_request("turn/interrupt",json!({"threadId":thread_id,"turnId":turn_id})).await?; interrupt_sent=true; cancelled=true; cancel_deadline=Some(Instant::now()+Duration::from_secs(5)); let _ = on_event(CodexEvent::Progress("Interrupt requested.".to_string())).await?;} else {cancelled=true; break;}
           }
-          _=async{if let Some(deadline)=cancel_deadline{sleep_until(deadline).await;}}, if cancel_deadline.is_some() => {cancelled=true; break;}
+          _=async{if let Some(deadline)=cancel_deadline{sleep_until(deadline).await;}}, if cancel_deadline.is_some() => {cancelled=true; process_ok=false; break;}
           next_message=process.next_message()=>{
-            let Some(message)=next_message? else {break;};
+            let Some(message)=next_message? else {process_ok=false; break;};
             match message{
               RpcMessage::Response{id,result,error}=>{
                 if id==turn_request_id{if let Some(error)=error{turn_error=Some(format_rpc_error(&error)); break;} if let Some(turn_id)=result.as_ref().and_then(|v|v.get("turn")).and_then(|t|t.get("id")).and_then(Value::as_str){active_turn_id=Some(turn_id.to_string());}}
                 else if error.is_some() && interrupt_sent {turn_error=Some(format!("turn/interrupt failed: {}",format_rpc_error(error.as_ref().expect("interrupt error missing")))); break;}
               }
               RpcMessage::Notification{method,params}=>{handle_notification(&method,&params,&mut summary,&mut active_turn_id,&mut turn_error,&mut turn_completed,on_event).await?;}
-                RpcMessage::ServerRequest{id,method,params}=>{handle_server_request(&mut process,id,&method,&params,on_event).await?;}
+                RpcMessage::ServerRequest{id,method,params}=>{handle_server_request(process,id,&method,&params,on_event).await?;}
             }
           }
         }
     }
-    summary.stderr_text = process.shutdown().await?;
     if let Some(error) = turn_error {
         bail!("{error}");
     }
     if cancelled {
         bail!("codex turn cancelled");
     }
-    Ok(summary)
+    Ok((summary, process_ok))
 }
 
 async fn handle_notification<F, Fut>(
@@ -448,6 +531,10 @@ where
                     .get("status")
                     .and_then(Value::as_str)
                     .unwrap_or("completed");
+                tracing::info!(
+                    "codex turn completed: status={status}, text={}chars",
+                    summary.assistant_text.len()
+                );
                 if status == "failed" {
                     *turn_error = Some(
                         turn.get("error")
@@ -465,6 +552,11 @@ where
         "item/agentMessage/delta" => {
             if let Some(delta) = params.get("delta").and_then(Value::as_str) {
                 summary.assistant_text.push_str(delta);
+                tracing::debug!(
+                    "codex delta: +{}chars, total={}chars",
+                    delta.len(),
+                    summary.assistant_text.len()
+                );
                 let _ = on_event(CodexEvent::AssistantText(summary.assistant_text.clone())).await?;
             }
         }
@@ -475,6 +567,7 @@ where
                         .get("command")
                         .and_then(Value::as_str)
                         .unwrap_or("command");
+                    tracing::info!("codex executing: {command}");
                     let _ = on_event(CodexEvent::Progress(format!("Running `{command}`"))).await?;
                 }
             }
@@ -488,6 +581,7 @@ where
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string();
+                        tracing::info!("codex message complete: {}chars", text.len());
                         summary.assistant_text = text.clone();
                         let _ = on_event(CodexEvent::AssistantText(text)).await?;
                     }
@@ -500,6 +594,7 @@ where
                             .get("command")
                             .and_then(Value::as_str)
                             .unwrap_or("command");
+                        tracing::info!("codex command {status}: {command}");
                         let output = item
                             .get("aggregatedOutput")
                             .and_then(Value::as_str)
@@ -535,6 +630,7 @@ where
 {
     match method {
         "item/commandExecution/requestApproval" => {
+            tracing::info!("codex requesting approval: command execution");
             let request = build_command_approval_request(params);
             let outcome = on_event(CodexEvent::ApprovalRequest(request)).await?;
             process
@@ -545,6 +641,7 @@ where
                 .await?;
         }
         "item/fileChange/requestApproval" => {
+            tracing::info!("codex requesting approval: file change");
             let request = build_file_change_approval_request(params);
             let outcome = on_event(CodexEvent::ApprovalRequest(request)).await?;
             process
@@ -555,11 +652,14 @@ where
                 .await?;
         }
         "item/tool/requestUserInput" => {
-            process.send_result(id, json!({"answers":{}})).await?;
-            let _ = on_event(CodexEvent::Progress(
-                "Tool requested user input, but Telegram replies are not wired yet.".to_string(),
-            ))
-            .await?;
+            tracing::info!("codex requesting user input");
+            let request = build_user_input_request(params);
+            let outcome = on_event(CodexEvent::UserInputRequest(request)).await?;
+            let answers = match outcome {
+                CodexEventOutcome::UserInput(answers) => answers,
+                _ => Value::Object(serde_json::Map::new()),
+            };
+            process.send_result(id, json!({"answers": answers})).await?;
         }
         _ => {
             bail!("unsupported app-server server request `{method}`");
@@ -613,12 +713,19 @@ where
     };
     loop {
         tokio::select! {
-          _=cancel.cancelled()=>{terminate_child(&mut child).await; let _=stderr_task.await; bail!("codex turn cancelled");}
-          next_line=stdout_lines.next_line()=>{match next_line.context("reading codex stdout failed")?{Some(line)=>{if let Some(event)=parse_exec_event(&line)?{match &event{CodexEvent::ThreadStarted(thread_id)=>summary.codex_thread_id=Some(thread_id.clone()),CodexEvent::AssistantText(text)=>summary.assistant_text=text.clone(),CodexEvent::Progress(_)|CodexEvent::ApprovalRequest(_)=>{}} let _ = on_event(event).await?;}},None=>break,}}
+          _=cancel.cancelled()=>{terminate_child(&mut child).await; let _=tokio::time::timeout(Duration::from_secs(5),stderr_task).await; bail!("codex turn cancelled");}
+          next_line=stdout_lines.next_line()=>{match next_line.context("reading codex stdout failed")?{Some(line)=>{if let Some(event)=parse_exec_event(&line)?{match &event{CodexEvent::ThreadStarted(thread_id)=>summary.codex_thread_id=Some(thread_id.clone()),CodexEvent::AssistantText(text)=>summary.assistant_text=text.clone(),CodexEvent::Progress(_)|CodexEvent::ApprovalRequest(_)|CodexEvent::UserInputRequest(_)=>{}} let _ = on_event(event).await?;}},None=>break,}}
         }
     }
-    let status = child.wait().await.context("waiting for codex failed")?;
-    let _ = stderr_task.await;
+    let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(result) => result.context("waiting for codex failed")?,
+        Err(_) => {
+            tracing::warn!("codex child.wait() timed out in review mode");
+            let _ = child.kill().await;
+            child.wait().await.context("waiting for codex after kill")?
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(5), stderr_task).await;
     summary.stderr_text = stderr_buffer.lock().await.trim().to_string();
     if !status.success() {
         if summary.stderr_text.is_empty() {
@@ -889,6 +996,59 @@ fn strip_ansi_codes(input: &str) -> String {
     clean
 }
 
+fn build_user_input_request(params: &Value) -> UserInputRequest {
+    let payload = approval_request_payload(params);
+    let prompt = payload
+        .get("prompt")
+        .or_else(|| payload.get("question"))
+        .or_else(|| params.get("prompt"))
+        .and_then(Value::as_str)
+        .unwrap_or("Please provide input")
+        .to_string();
+    let fields = payload
+        .get("fields")
+        .or_else(|| params.get("fields"))
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(parse_input_field).collect())
+        .unwrap_or_else(|| {
+            vec![UserInputField {
+                name: "input".to_string(),
+                label: prompt.clone(),
+                options: vec![],
+                required: true,
+            }]
+        });
+    UserInputRequest { prompt, fields }
+}
+
+fn parse_input_field(value: &Value) -> Option<UserInputField> {
+    let name = value.get("name")?.as_str()?.to_string();
+    let label = value
+        .get("label")
+        .or_else(|| value.get("description"))
+        .and_then(Value::as_str)
+        .unwrap_or(&name)
+        .to_string();
+    let options = value
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|o| {
+                    o.as_str().map(String::from)
+                        .or_else(|| o.get("label").and_then(Value::as_str).map(String::from))
+                        .or_else(|| o.get("value").and_then(Value::as_str).map(String::from))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let required = value
+        .get("required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Some(UserInputField { name, label, options, required })
+}
+
 fn build_command_approval_request(params: &Value) -> CodexApprovalRequest {
     let payload = approval_request_payload(params);
     let command = payload
@@ -1017,7 +1177,7 @@ fn approval_decision_value(decision: CodexApprovalDecision) -> &'static str {
 fn outcome_to_approval_decision(outcome: CodexEventOutcome) -> CodexApprovalDecision {
     match outcome {
         CodexEventOutcome::Approval(decision) => decision,
-        CodexEventOutcome::None => CodexApprovalDecision::Decline,
+        CodexEventOutcome::None | CodexEventOutcome::UserInput(_) => CodexApprovalDecision::Decline,
     }
 }
 
@@ -1193,8 +1353,18 @@ impl AppServerProcess {
             .context("flushing app-server stdin failed")
     }
     async fn shutdown(mut self) -> Result<String> {
+        // Drop stdin/stdout first so pipes close and child can exit cleanly.
+        drop(self.stdin);
+        drop(self.stdout_lines);
         terminate_child(&mut self.child).await;
-        let _ = self.stderr_task.await;
+        // stderr_task reads until EOF; give it a bounded wait so we don't hang
+        // if a grandchild process inherited the stderr fd.
+        match tokio::time::timeout(Duration::from_secs(5), self.stderr_task).await {
+            Ok(_) => {}
+            Err(_) => {
+                tracing::warn!("codex stderr reader did not finish within 5s, proceeding anyway");
+            }
+        }
         Ok(self.stderr_buffer.lock().await.trim().to_string())
     }
 }
@@ -1293,7 +1463,12 @@ async fn terminate_child(child: &mut Child) {
             tracing::warn!("failed to inspect codex child status: {error}");
         }
     }
-    let _ = child.wait().await;
+    match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(_) => {}
+        Err(_) => {
+            tracing::warn!("codex child.wait() did not finish within 5s, proceeding anyway");
+        }
+    }
 }
 fn parse_exec_event(line: &str) -> Result<Option<CodexEvent>> {
     let envelope: ExecEnvelope = match serde_json::from_str(line) {

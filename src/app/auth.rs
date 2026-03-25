@@ -15,7 +15,16 @@ impl App {
         chat_id: i64,
         thread_id: Option<i64>,
     ) -> Result<bool> {
-        let status = self.shared.codex.auth_status().await?;
+        tracing::debug!("checking codex auth status...");
+        let status = match timeout(Duration::from_secs(10), self.shared.codex.auth_status()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                tracing::warn!("codex login status timed out after 10s");
+                // Assume authenticated to avoid blocking the polling loop
+                return Ok(true);
+            }
+        };
+        tracing::debug!("codex auth: authenticated={}", status.authenticated);
         if status.authenticated {
             return Ok(true);
         }

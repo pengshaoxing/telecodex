@@ -174,6 +174,136 @@ pub(super) async fn request_telegram_approval(
     Ok(decision)
 }
 
+// uin:{token}:{field_name}:{answer}
+pub(super) fn parse_user_input_callback_data(
+    data: &str,
+) -> Option<(String, String, String)> {
+    let mut parts = data.splitn(4, ':');
+    if parts.next()? != "uin" {
+        return None;
+    }
+    let token = parts.next()?.to_string();
+    let field_name = parts.next()?.to_string();
+    let answer = parts.next()?.to_string();
+    Some((token, field_name, answer))
+}
+
+fn user_input_keyboard(
+    token: &str,
+    field: &crate::codex::UserInputField,
+) -> Option<InlineKeyboardMarkup> {
+    if field.options.is_empty() {
+        return None;
+    }
+    let inline_keyboard = field
+        .options
+        .iter()
+        .map(|opt| {
+            vec![InlineKeyboardButton {
+                text: opt.clone(),
+                callback_data: Some(format!("uin:{}:{}:{}", token, field.name, opt)),
+                url: None,
+            }]
+        })
+        .collect::<Vec<_>>();
+    Some(InlineKeyboardMarkup { inline_keyboard })
+}
+
+pub(super) async fn request_telegram_user_input(
+    shared: Arc<AppShared>,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    session_key: SessionKey,
+    requester_user_id: i64,
+    request: crate::codex::UserInputRequest,
+    cancel: CancellationToken,
+) -> Result<serde_json::Value> {
+    let token = Uuid::now_v7().simple().to_string();
+    let (sender, receiver) = oneshot::channel::<serde_json::Value>();
+
+    shared.pending_user_inputs.lock().await.insert(
+        token.clone(),
+        PendingUserInput {
+            requester_user_id,
+            responder: sender,
+        },
+    );
+
+    let prompt = request.prompt.clone();
+    let field = request
+        .fields
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| crate::codex::UserInputField {
+            name: "input".to_string(),
+            label: prompt.clone(),
+            options: vec![],
+            required: true,
+        });
+
+    let keyboard = user_input_keyboard(&token, &field);
+    let label = if field.label.is_empty() {
+        &prompt
+    } else {
+        &field.label
+    };
+    let body = format!("**Input required**\n\n{label}");
+
+    if keyboard.is_some() {
+        if let Err(error) =
+            send_markdown_message(&shared.telegram, chat_id, thread_id, &body, keyboard).await
+        {
+            shared.pending_user_inputs.lock().await.remove(&token);
+            return Err(error);
+        }
+    } else {
+        shared.pending_text_inputs.lock().await.insert(
+            session_key,
+            PendingTextInput {
+                token: token.clone(),
+                field_name: field.name.clone(),
+            },
+        );
+        let prompt_body = format!("{body}\n\n_Reply with your answer._");
+        if let Err(error) =
+            send_markdown_message(&shared.telegram, chat_id, thread_id, &prompt_body, None).await
+        {
+            shared.pending_user_inputs.lock().await.remove(&token);
+            shared.pending_text_inputs.lock().await.remove(&session_key);
+            return Err(error);
+        }
+    }
+
+    let timeout = tokio::time::sleep(Duration::from_secs(15 * 60));
+    tokio::pin!(timeout);
+
+    let (answers, send_status) = tokio::select! {
+        result = receiver => (
+            result.unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
+            false,
+        ),
+        _ = cancel.cancelled() => (serde_json::Value::Object(Default::default()), true),
+        _ = &mut timeout => (serde_json::Value::Object(Default::default()), true),
+    };
+
+    shared.pending_user_inputs.lock().await.remove(&token);
+    shared.pending_text_inputs.lock().await.remove(&session_key);
+
+    if send_status {
+        send_markdown_message(
+            &shared.telegram,
+            chat_id,
+            thread_id,
+            "Input request timed out or was cancelled.",
+            None,
+        )
+        .await
+        .ok();
+    }
+
+    Ok(answers)
+}
+
 pub(super) fn quick_reply_keyboard(commands: &[Vec<String>]) -> Option<InlineKeyboardMarkup> {
     let inline_keyboard = commands
         .iter()
@@ -224,8 +354,22 @@ pub(super) fn format_model_help_text(
     current_label: &str,
     available_models: &[AvailableModel],
 ) -> String {
-    let _ = available_models;
-    format!("Current model: `{current_label}`")
+    let mut lines = vec![format!("Current model: `{current_label}`")];
+    if !available_models.is_empty() {
+        lines.push(String::new());
+        lines.push("Available models:".to_string());
+        for model in available_models {
+            let default_marker = if model.is_default { " (default)" } else { "" };
+            let desc = model
+                .description
+                .as_deref()
+                .filter(|d| !d.is_empty())
+                .map(|d| format!(" — {d}"))
+                .unwrap_or_default();
+            lines.push(format!("• `{}`{default_marker}{desc}", model.id));
+        }
+    }
+    lines.join("\n")
 }
 
 fn prioritized_model_ids(

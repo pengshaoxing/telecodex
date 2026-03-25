@@ -336,7 +336,9 @@ fn formats_model_help_text_from_catalog() {
     );
 
     assert!(text.contains("Current model: `gpt-5.4`"));
-    assert_eq!(text, "Current model: `gpt-5.4`");
+    assert!(text.contains("Available models:"));
+    assert!(text.contains("• `gpt-5.4` (default)"));
+    assert!(text.contains("• `gpt-5.3-codex`"));
 }
 
 #[test]

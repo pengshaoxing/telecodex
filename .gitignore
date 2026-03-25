@@ -8,3 +8,4 @@ tmp-config.toml
 .env.*
 .telecodex/
 .build-number
+*.log
