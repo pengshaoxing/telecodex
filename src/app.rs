@@ -369,6 +369,25 @@ impl App {
         } else {
             "Analyze the attached files.".to_string()
         };
+        let reply_context = match message.reply_to_message.as_deref().map(resolve_reply) {
+            Some(ReplyResolution::ToolMessage) => {
+                // Notify the user without replying to the tool message itself, so they
+                // know to reference an assistant response instead.
+                self.shared
+                    .telegram
+                    .send_message(SendMessage::html(
+                        session_key.chat_id,
+                        Some(session_key.thread_id).filter(|v| *v != 0),
+                        "⚠️ Tool action messages cannot be referenced. \
+                         Please reply to the assistant's response instead."
+                            .to_string(),
+                    ))
+                    .await?;
+                return Ok(());
+            }
+            Some(ReplyResolution::Context(ctx)) => Some(ctx),
+            _ => None,
+        };
         let request = TurnRequest {
             session_key,
             from_user_id: from.id,
@@ -377,6 +396,7 @@ impl App {
             attachments,
             review_mode: None,
             override_search_mode: auto_search_mode_for_prompt(text),
+            reply_context,
         };
         self.enqueue_turn(request, &message.chat.kind).await?;
         Ok(())
@@ -593,6 +613,10 @@ impl App {
         match parsed {
             ParsedInput::Forward(text) => {
                 let session = self.ensure_session(session_key, user.tg_user_id)?;
+                let reply_context = message
+                    .reply_to_message
+                    .as_deref()
+                    .and_then(extract_reply_context);
                 let request = TurnRequest {
                     session_key,
                     from_user_id: user.tg_user_id,
@@ -603,6 +627,7 @@ impl App {
                     override_search_mode: auto_search_mode_for_prompt(
                         message.text.as_deref().unwrap_or(""),
                     ),
+                    reply_context,
                 };
                 self.enqueue_turn(request, &message.chat.kind).await?;
             }
@@ -672,14 +697,19 @@ impl App {
                     }
                 }
                 BridgeCommand::Review(review) => {
+                    // Forward as a natural-language prompt to the persistent app-server
+                    // session so review results are part of the conversation context and
+                    // the user can ask follow-up questions without triggering a new review.
+                    let prompt = build_review_prompt(&review);
                     let request = TurnRequest {
                         session_key,
                         from_user_id: user.tg_user_id,
-                        prompt: review.prompt.clone().unwrap_or_default(),
+                        prompt,
                         runtime_instructions: None,
                         attachments: vec![],
-                        review_mode: Some(review),
+                        review_mode: None,
                         override_search_mode: None,
+                        reply_context: None,
                     };
                     self.enqueue_turn(request, &message.chat.kind).await?;
                 }
@@ -1424,9 +1454,9 @@ impl App {
         let shared = self.shared.clone();
         tokio::spawn(async move {
             let mut server: Option<SessionAppServer> = None;
-            const IDLE_PROCESS_TIMEOUT: Duration = Duration::from_secs(300);
+            let idle_process_timeout = Duration::from_secs(shared.config.idle_process_timeout_seconds);
             loop {
-                match tokio::time::timeout(IDLE_PROCESS_TIMEOUT, rx.recv()).await {
+                match tokio::time::timeout(idle_process_timeout, rx.recv()).await {
                     Ok(Some(WorkerMessage::Turn(turn))) => {
                         if let Err(error) =
                             process_turn(shared.clone(), cancel.clone(), &mut server, turn).await
@@ -1474,6 +1504,91 @@ impl App {
             false
         }
     }
+}
+
+/// Emoji prefixes used by bot tool-action / progress messages.
+/// When the replied-to message starts with any of these, we skip it
+/// because it carries no conversational value.
+const TOOL_MESSAGE_PREFIXES: &[&str] = &[
+    "🔧", "📝", "🔌", "🔍", "🤖", "⚡", "⏳", "💭", "⚠️",
+];
+
+enum ReplyResolution {
+    /// Useful context to pass to Codex.
+    Context(crate::models::ReplyContext),
+    /// The replied-to message is a bot tool-action/progress notification.
+    /// Should notify the user that referencing it has no effect.
+    ToolMessage,
+    /// No text or otherwise not actionable — silently ignored.
+    Ignored,
+}
+
+fn resolve_reply(replied: &Message) -> ReplyResolution {
+    let text = match replied.text.as_deref().or(replied.caption.as_deref()) {
+        Some(t) => t,
+        None => return ReplyResolution::Ignored,
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return ReplyResolution::Ignored;
+    }
+    let is_from_bot = replied.from.as_ref().map_or(false, |u| u.is_bot);
+    if is_from_bot && TOOL_MESSAGE_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+        return ReplyResolution::ToolMessage;
+    }
+    const MAX_CHARS: usize = 500;
+    let truncated = if trimmed.chars().count() > MAX_CHARS {
+        let end = trimmed
+            .char_indices()
+            .nth(MAX_CHARS)
+            .map(|(i, _)| i)
+            .unwrap_or(trimmed.len());
+        format!("{}…", &trimmed[..end])
+    } else {
+        trimmed.to_string()
+    };
+    ReplyResolution::Context(crate::models::ReplyContext {
+        text: truncated,
+        is_from_bot,
+    })
+}
+
+/// Convenience wrapper used where tool-message replies are silently ignored.
+fn extract_reply_context(replied: &Message) -> Option<crate::models::ReplyContext> {
+    match resolve_reply(replied) {
+        ReplyResolution::Context(ctx) => Some(ctx),
+        _ => None,
+    }
+}
+
+fn build_review_prompt(review: &crate::models::ReviewRequest) -> String {
+    let target = if let Some(base) = &review.base {
+        format!("the git diff compared to the `{base}` branch")
+    } else if let Some(commit) = &review.commit {
+        format!("commit `{commit}`")
+    } else {
+        "the current uncommitted (staged and unstaged) changes".to_string()
+    };
+
+    let title_part = review
+        .title
+        .as_deref()
+        .map(|t| format!(" (title: {t})"))
+        .unwrap_or_default();
+
+    let focus_part = review
+        .prompt
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| format!("\n\nFocus: {p}"))
+        .unwrap_or_default();
+
+    format!(
+        "Please run a code review on {target}{title_part}. \
+         Use git tools to view the diff, then analyze the changes for quality, \
+         correctness, potential bugs, and improvements. \
+         Provide your findings in a clear, structured format.{focus_part}"
+    )
 }
 
 #[cfg(test)]

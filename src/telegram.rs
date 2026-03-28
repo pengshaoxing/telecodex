@@ -521,6 +521,7 @@ pub struct Message {
     pub audio: Option<Audio>,
     pub voice: Option<Voice>,
     pub video: Option<Video>,
+    pub reply_to_message: Option<Box<Message>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

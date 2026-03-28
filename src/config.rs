@@ -23,6 +23,8 @@ pub struct Config {
     pub tmp_dir: Option<PathBuf>,
     pub log_file: Option<PathBuf>,
     pub whisper: Option<WhisperConfig>,
+    #[serde(default = "default_idle_process_timeout_seconds")]
+    pub idle_process_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,6 +38,8 @@ pub struct WhisperConfig {
     pub language: Option<String>,
     #[serde(default = "default_whisper_timeout")]
     pub timeout_seconds: u64,
+    #[serde(default = "default_whisper_speed_factor")]
+    pub speed_factor: f64,
 }
 
 impl WhisperConfig {
@@ -306,6 +310,14 @@ fn default_whisper_model() -> String {
 
 fn default_whisper_timeout() -> u64 {
     60
+}
+
+fn default_whisper_speed_factor() -> f64 {
+    1.0
+}
+
+fn default_idle_process_timeout_seconds() -> u64 {
+    300
 }
 
 fn resolve_binary_path(input: &Path) -> Result<PathBuf> {

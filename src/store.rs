@@ -697,6 +697,7 @@ mod tests {
                 prompt: None,
             }),
             override_search_mode: None,
+            reply_context: None,
         };
         let turn_id = store.record_turn_started(session.id, &request).unwrap();
         store

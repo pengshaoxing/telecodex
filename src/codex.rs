@@ -29,6 +29,7 @@ pub struct RunSummary {
     pub codex_thread_id: Option<String>,
     pub assistant_text: String,
     pub stderr_text: String,
+    pub(crate) phase_text: String,
 }
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct AvailableModel {
@@ -43,7 +44,10 @@ pub struct AvailableModel {
 #[derive(Debug, Clone)]
 pub enum CodexEvent {
     Progress(String),
+    ToolAction(String),
+    Thinking(String),
     AssistantText(String),
+    AgentMessageCompleted,
     ThreadStarted(String),
     ApprovalRequest(CodexApprovalRequest),
     UserInputRequest(UserInputRequest),
@@ -450,6 +454,7 @@ where
         codex_thread_id: Some(thread_id.to_string()),
         assistant_text: String::new(),
         stderr_text: String::new(),
+        phase_text: String::new(),
     };
     let turn_request_id = process
         .send_request(
@@ -551,24 +556,89 @@ where
         }
         "item/agentMessage/delta" => {
             if let Some(delta) = params.get("delta").and_then(Value::as_str) {
-                summary.assistant_text.push_str(delta);
+                summary.phase_text.push_str(delta);
                 tracing::debug!(
-                    "codex delta: +{}chars, total={}chars",
+                    "codex delta: +{}chars, phase={}chars",
                     delta.len(),
-                    summary.assistant_text.len()
+                    summary.phase_text.len()
                 );
-                let _ = on_event(CodexEvent::AssistantText(summary.assistant_text.clone())).await?;
+                let _ =
+                    on_event(CodexEvent::AssistantText(summary.phase_text.clone())).await?;
             }
         }
         "item/started" => {
             if let Some(item) = params.get("item") {
-                if item.get("type").and_then(Value::as_str) == Some("commandExecution") {
-                    let command = item
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .unwrap_or("command");
-                    tracing::info!("codex executing: {command}");
-                    let _ = on_event(CodexEvent::Progress(format!("Running `{command}`"))).await?;
+                match item.get("type").and_then(Value::as_str) {
+                    Some("commandExecution") => {
+                        let command = item
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .unwrap_or("command");
+                        tracing::info!("codex executing: {command}");
+                        let _ =
+                            on_event(CodexEvent::ToolAction(format!("🔧 Running `{command}`")))
+                                .await?;
+                    }
+                    Some("fileChange") => {
+                        let file = item
+                            .get("file")
+                            .and_then(Value::as_str)
+                            .unwrap_or("file");
+                        tracing::info!("codex editing file: {file}");
+                        let _ =
+                            on_event(CodexEvent::ToolAction(format!("📝 Editing `{file}`"))).await?;
+                    }
+                    Some("mcpToolCall") => {
+                        let name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool");
+                        tracing::info!("codex calling MCP tool: {name}");
+                        let _ =
+                            on_event(CodexEvent::ToolAction(format!("🔌 Calling tool `{name}`")))
+                                .await?;
+                    }
+                    Some("webSearch") => {
+                        tracing::info!("codex searching the web");
+                        let _ =
+                            on_event(CodexEvent::ToolAction("🔍 Searching the web...".to_string()))
+                                .await?;
+                    }
+                    Some("reasoning") => {
+                        tracing::debug!("codex reasoning started");
+                        let _ =
+                            on_event(CodexEvent::Progress("Thinking...".to_string())).await?;
+                    }
+                    Some("collabAgentToolCall") => {
+                        let tool = item
+                            .get("tool")
+                            .and_then(Value::as_str)
+                            .unwrap_or("agent");
+                        let prompt_preview = item
+                            .get("prompt")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .chars()
+                            .take(80)
+                            .collect::<String>();
+                        tracing::info!("codex spawning subagent: {tool}");
+                        let label = if prompt_preview.is_empty() {
+                            format!("🤖 Delegating to subagent `{tool}`")
+                        } else {
+                            format!("🤖 Delegating to subagent `{tool}`: {prompt_preview}")
+                        };
+                        let _ = on_event(CodexEvent::ToolAction(label)).await?;
+                    }
+                    Some("dynamicToolCall") => {
+                        let tool = item
+                            .get("tool")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool");
+                        tracing::info!("codex calling dynamic tool: {tool}");
+                        let _ =
+                            on_event(CodexEvent::ToolAction(format!("⚡ Calling `{tool}`"))).await?;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -582,8 +652,14 @@ where
                             .unwrap_or_default()
                             .to_string();
                         tracing::info!("codex message complete: {}chars", text.len());
-                        summary.assistant_text = text.clone();
+                        summary.phase_text = text.clone();
+                        if !summary.assistant_text.is_empty() {
+                            summary.assistant_text.push_str("\n\n");
+                        }
+                        summary.assistant_text.push_str(&text);
                         let _ = on_event(CodexEvent::AssistantText(text)).await?;
+                        let _ = on_event(CodexEvent::AgentMessageCompleted).await?;
+                        summary.phase_text.clear();
                     }
                     Some("commandExecution") => {
                         let status = item
@@ -610,6 +686,20 @@ where
                     }
                     _ => {}
                 }
+            }
+        }
+        "item/reasoning/summaryTextDelta" => {
+            if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                if !delta.trim().is_empty() {
+                    tracing::debug!("codex thinking: +{}chars", delta.len());
+                    let _ = on_event(CodexEvent::Thinking(delta.to_string())).await?;
+                }
+            }
+        }
+        "item/mcpToolCall/progress" => {
+            if let Some(message) = params.get("message").and_then(Value::as_str) {
+                tracing::debug!("codex mcp progress: {message}");
+                let _ = on_event(CodexEvent::Progress(message.to_string())).await?;
             }
         }
         _ => {}
@@ -710,11 +800,12 @@ where
         codex_thread_id: None,
         assistant_text: String::new(),
         stderr_text: String::new(),
+        phase_text: String::new(),
     };
     loop {
         tokio::select! {
           _=cancel.cancelled()=>{terminate_child(&mut child).await; let _=tokio::time::timeout(Duration::from_secs(5),stderr_task).await; bail!("codex turn cancelled");}
-          next_line=stdout_lines.next_line()=>{match next_line.context("reading codex stdout failed")?{Some(line)=>{if let Some(event)=parse_exec_event(&line)?{match &event{CodexEvent::ThreadStarted(thread_id)=>summary.codex_thread_id=Some(thread_id.clone()),CodexEvent::AssistantText(text)=>summary.assistant_text=text.clone(),CodexEvent::Progress(_)|CodexEvent::ApprovalRequest(_)|CodexEvent::UserInputRequest(_)=>{}} let _ = on_event(event).await?;}},None=>break,}}
+          next_line=stdout_lines.next_line()=>{match next_line.context("reading codex stdout failed")?{Some(line)=>{if let Some(event)=parse_exec_event(&line)?{match &event{CodexEvent::ThreadStarted(thread_id)=>summary.codex_thread_id=Some(thread_id.clone()),CodexEvent::AssistantText(text)=>summary.assistant_text=text.clone(),CodexEvent::AgentMessageCompleted|CodexEvent::Progress(_)|CodexEvent::ToolAction(_)|CodexEvent::Thinking(_)|CodexEvent::ApprovalRequest(_)|CodexEvent::UserInputRequest(_)=>{}} let _ = on_event(event).await?;}},None=>break,}}
         }
     }
     let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
@@ -762,7 +853,11 @@ fn build_review_command(
         session.reasoning_effort.as_deref(),
         developer_instructions.as_deref(),
     );
-    if review.uncommitted {
+    // --uncommitted and [PROMPT] are mutually exclusive in the codex CLI.
+    // Only add --uncommitted when there is no freeform prompt to pass.
+    let has_prompt = review.prompt.is_some()
+        || (!request.prompt.is_empty() && request.prompt != "Follow the session instructions.");
+    if review.uncommitted && !has_prompt {
         args.push("--uncommitted".to_string());
     }
     if let Some(base) = &review.base {
@@ -779,7 +874,9 @@ fn build_review_command(
     }
     if let Some(prompt) = &review.prompt {
         args.push(prompt.clone());
-    } else if !request.prompt.is_empty() {
+    } else if !request.prompt.is_empty()
+        && request.prompt != "Follow the session instructions."
+    {
         args.push(request.prompt.clone());
     }
     CommandSpec {
@@ -1593,6 +1690,7 @@ mod tests {
                 prompt: Some("focus on regressions".to_string()),
             }),
             override_search_mode: None,
+            reply_context: None,
         }
     }
 

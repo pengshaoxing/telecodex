@@ -73,6 +73,14 @@ pub struct SessionRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct ReplyContext {
+    /// Plain text of the replied-to message, truncated to 500 chars.
+    pub text: String,
+    /// True when the replied-to message was sent by the bot.
+    pub is_from_bot: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct TurnRequest {
     pub session_key: SessionKey,
     pub from_user_id: i64,
@@ -81,6 +89,7 @@ pub struct TurnRequest {
     pub attachments: Vec<LocalAttachment>,
     pub review_mode: Option<ReviewRequest>,
     pub override_search_mode: Option<SearchMode>,
+    pub reply_context: Option<ReplyContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,7 +128,6 @@ pub struct LocalAttachment {
 
 #[derive(Debug, Clone)]
 pub struct AttachmentTranscript {
-    #[allow(dead_code)]
     pub engine: String,
     pub text: String,
 }

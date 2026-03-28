@@ -152,23 +152,100 @@ fn is_valid_parakeet_model_dir(dir: &Path) -> bool {
     .all(|name| dir.join(name).is_file())
 }
 
+async fn try_speedup_audio(source_path: &Path, speed_factor: f64) -> Option<PathBuf> {
+    if speed_factor <= 1.0 {
+        return None;
+    }
+
+    let extension = source_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("ogg");
+    let sped_up_path = source_path.with_extension(format!("speedup.{extension}"));
+
+    // FFmpeg atempo filter only supports 0.5..100.0; chain filters for values > 2.0
+    let mut atempo_filters = Vec::new();
+    let mut remaining = speed_factor;
+    while remaining > 2.0 {
+        atempo_filters.push("atempo=2.0".to_string());
+        remaining /= 2.0;
+    }
+    atempo_filters.push(format!("atempo={remaining:.4}"));
+    let filter_chain = atempo_filters.join(",");
+
+    tracing::debug!(
+        "ffmpeg: speeding up audio {:.1}x with filter '{filter_chain}'",
+        speed_factor,
+    );
+
+    let result = tokio::process::Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-i")
+        .arg(source_path)
+        .arg("-filter:a")
+        .arg(&filter_chain)
+        .arg(&sped_up_path)
+        .output()
+        .await;
+
+    match result {
+        Ok(output) if output.status.success() => {
+            tracing::info!(
+                "ffmpeg: audio sped up {:.1}x, output={}",
+                speed_factor,
+                sped_up_path.display(),
+            );
+            Some(sped_up_path)
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!(
+                "ffmpeg speedup failed (status {}), falling back to original audio: {}",
+                output.status,
+                stderr.lines().last().unwrap_or_default(),
+            );
+            let _ = tokio::fs::remove_file(&sped_up_path).await;
+            None
+        }
+        Err(err) => {
+            tracing::warn!("ffmpeg not available for speedup, falling back to original audio: {err}");
+            None
+        }
+    }
+}
+
 pub async fn transcribe_audio_remote(
     client: &reqwest::Client,
     config: &crate::config::WhisperConfig,
     source_path: &Path,
 ) -> Result<AttachmentTranscript> {
+    let sped_up_file = try_speedup_audio(source_path, config.speed_factor).await;
+    let effective_path = sped_up_file.as_deref().unwrap_or(source_path);
+    let result = whisper_api_call(client, config, effective_path).await;
+    // Always clean up the temporary sped-up file, regardless of success or failure.
+    if let Some(path) = &sped_up_file {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    result
+}
+
+async fn whisper_api_call(
+    client: &reqwest::Client,
+    config: &crate::config::WhisperConfig,
+    audio_path: &Path,
+) -> Result<AttachmentTranscript> {
     let api_key = config
         .resolve_api_key()
         .ok_or_else(|| anyhow::anyhow!("whisper API key not configured"))?;
 
-    let file_name = source_path
+    let file_name = audio_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("audio.ogg")
         .to_string();
-    let file_bytes = tokio::fs::read(source_path)
+    let file_bytes = tokio::fs::read(audio_path)
         .await
-        .with_context(|| format!("failed to read audio file: {}", source_path.display()))?;
+        .with_context(|| format!("failed to read audio file: {}", audio_path.display()))?;
 
     let file_part = reqwest::multipart::Part::bytes(file_bytes)
         .file_name(file_name)

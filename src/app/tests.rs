@@ -44,6 +44,7 @@ fn sample_turn_request(session_key: SessionKey) -> TurnRequest {
         attachments: vec![],
         review_mode: None,
         override_search_mode: None,
+            reply_context: None,
     }
 }
 
@@ -516,6 +517,7 @@ fn keeps_audio_transcript_in_user_prompt_only() {
         }],
         review_mode: None,
         override_search_mode: None,
+            reply_context: None,
     };
 
     let runtime_request = prepare_runtime_request(&session, &request, &workspace);
@@ -571,6 +573,7 @@ fn keeps_non_transcribed_audio_paths_in_user_prompt() {
         }],
         review_mode: None,
         override_search_mode: None,
+            reply_context: None,
     };
 
     let runtime_request = prepare_runtime_request(&session, &request, &workspace);
@@ -719,6 +722,7 @@ async fn upload_failure_marks_turn_failed_and_cleanup_still_runs() {
         codex_thread_id: Some("thread-123".to_string()),
         assistant_text: "answer".to_string(),
         stderr_text: String::new(),
+        phase_text: String::new(),
     };
     let failure_messages = Arc::new(StdMutex::new(Vec::<String>::new()));
     let failure_messages_sink = failure_messages.clone();

@@ -5,6 +5,7 @@ edit_debounce_ms = 900
 max_text_chunk = 3500
 tmp_dir = "/absolute/path/to/telecodex/tmp"
 log_file = "telecodex.log"
+idle_process_timeout_seconds = 300  # Seconds before idle codex process is shut down (default: 300)
 
 [telegram]
 bot_token_env = "TELEGRAM_BOT_TOKEN"
@@ -40,3 +41,4 @@ default_add_dirs = [
 # language = "zh"
 # initial_prompt = "Telecodex, Codex, Telegram, Rust, Python"
 # timeout_seconds = 60
+# speed_factor = 2.0  # Speed up audio before sending to API (requires ffmpeg). Saves cost. 1.0 = no speedup.

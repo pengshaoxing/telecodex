@@ -142,7 +142,20 @@ pub(super) async fn process_turn(
                             Ok(CodexEventOutcome::UserInput(answers))
                         }
                         other => {
+                            // Spawn a real timer flush for the first ToolAction in a batch so
+                            // that long-running commands are visible without waiting for the
+                            // next event.  If the buffer is flushed earlier (by a non-ToolAction
+                            // event), flush_tool_actions() is a no-op.
+                            let is_first_tool_action = matches!(other, CodexEvent::ToolAction(_))
+                                && sink.lock().await.tool_action_buffer.is_empty();
                             sink.lock().await.handle_event(other).await?;
+                            if is_first_tool_action {
+                                let sink_for_timer = sink.clone();
+                                tokio::spawn(async move {
+                                    sleep(Duration::from_millis(TOOL_ACTION_BATCH_MS)).await;
+                                    sink_for_timer.lock().await.flush_tool_actions().await;
+                                });
+                            }
                             Ok(CodexEventOutcome::None)
                         }
                     }
@@ -358,6 +371,8 @@ pub(super) fn should_reset_session_after_error(error: &anyhow::Error) -> bool {
     matches(&pretty) || matches(&display)
 }
 
+const TOOL_ACTION_BATCH_MS: u64 = 400;
+
 struct LiveTurnSink {
     shared: Arc<AppShared>,
     session_key: SessionKey,
@@ -368,6 +383,7 @@ struct LiveTurnSink {
     last_flushed_text: String,
     last_flush_at: Instant,
     edit_backoff_until: Option<Instant>,
+    tool_action_buffer: Vec<String>,
 }
 
 impl LiveTurnSink {
@@ -387,19 +403,40 @@ impl LiveTurnSink {
             last_flushed_text: String::new(),
             last_flush_at: Instant::now() - Duration::from_secs(60),
             edit_backoff_until: None,
+            tool_action_buffer: Vec::new(),
         }
     }
 
     async fn handle_event(&mut self, event: CodexEvent) -> Result<()> {
+        // Non-ToolAction events flush any pending tool action buffer first
+        if !matches!(event, CodexEvent::ToolAction(_)) {
+            self.flush_tool_actions().await;
+        }
+
         match event {
             CodexEvent::Progress(text) => {
                 if !self.has_assistant_text {
                     self.pending_text = progress_status_text(&text);
                 }
             }
+            CodexEvent::ToolAction(text) => {
+                self.tool_action_buffer.push(text);
+                // Timer-based flush is handled externally in the event callback.
+                return Ok(());
+            }
+            CodexEvent::Thinking(delta) => {
+                if !self.has_assistant_text {
+                    let preview = truncate_thinking_preview(&delta);
+                    self.pending_text = format!("💭 _{preview}_");
+                }
+            }
             CodexEvent::AssistantText(text) => {
                 self.pending_text = text;
                 self.has_assistant_text = true;
+            }
+            CodexEvent::AgentMessageCompleted => {
+                self.finalize_phase().await;
+                return Ok(());
             }
             CodexEvent::ThreadStarted(thread_id) => {
                 tracing::debug!("codex thread started: {thread_id}");
@@ -427,13 +464,140 @@ impl LiveTurnSink {
         Ok(())
     }
 
+    async fn finalize_phase(&mut self) {
+        // Force-write the current text to the last streaming message (skip debounce).
+        let visible = self.visible_text(false);
+        if let Some(last_msg) = self.messages.last().cloned() {
+            let html = render_markdown_to_html(&visible);
+            let _ = self.edit_message(last_msg, &visible, &html).await;
+        }
+
+        // Send a new placeholder for the next phase.
+        let thread_id = Some(self.session_key.thread_id).filter(|v| *v != 0);
+        match self
+            .shared
+            .telegram
+            .send_message(SendMessage::html(
+                self.session_key.chat_id,
+                thread_id,
+                "<i>⏳</i>".to_string(),
+            ))
+            .await
+        {
+            Ok(new_msg) => {
+                // Detach all finalized messages from tracking.
+                self.messages.clear();
+                self.messages.push(TelegramMessageRef {
+                    chat_id: self.session_key.chat_id,
+                    message_id: new_msg.message_id,
+                });
+            }
+            Err(e) => {
+                tracing::debug!("failed to send phase placeholder: {e:#}");
+            }
+        }
+
+        // Reset streaming state for the next phase.
+        self.pending_text = "⏳".to_string();
+        self.has_assistant_text = false;
+        self.last_flushed_text.clear();
+        self.last_flush_at = Instant::now() - Duration::from_secs(60);
+    }
+
+    async fn flush_tool_actions(&mut self) {
+        if self.tool_action_buffer.is_empty() {
+            return;
+        }
+        let actions = std::mem::take(&mut self.tool_action_buffer);
+
+        let thread_id = Some(self.session_key.thread_id).filter(|value| *value != 0);
+        let tool_html = format_tool_actions_html(&actions);
+
+        if let Some(last_msg) = self.messages.last().cloned() {
+            // Compute initial content for the new streaming placeholder so there's no blank flash.
+            let initial_html = {
+                let visible = self.visible_text(false);
+                let chunks = split_text(&visible, self.shared.config.max_text_chunk);
+                chunks
+                    .last()
+                    .map(|chunk| render_markdown_to_html(chunk))
+                    .unwrap_or_else(|| "<i>⏳</i>".to_string())
+            };
+
+            // Edit the current last streaming message to become the tool action record,
+            // anchoring it in place. Then send a new streaming placeholder at the bottom.
+            let _ = self
+                .shared
+                .telegram
+                .edit_message_text(EditMessageText::html(
+                    last_msg.chat_id,
+                    last_msg.message_id,
+                    tool_html,
+                ))
+                .await;
+
+            match self
+                .shared
+                .telegram
+                .send_message(SendMessage::html(
+                    self.session_key.chat_id,
+                    thread_id,
+                    initial_html,
+                ))
+                .await
+            {
+                Ok(new_msg) => {
+                    *self.messages.last_mut().unwrap() = TelegramMessageRef {
+                        chat_id: self.session_key.chat_id,
+                        message_id: new_msg.message_id,
+                    };
+                    // Force the next flush to update the new placeholder immediately.
+                    self.last_flushed_text = String::new();
+                    self.last_flush_at = Instant::now() - Duration::from_secs(60);
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        "failed to send new streaming placeholder after tool actions: {error:#}"
+                    );
+                }
+            }
+        } else {
+            // Fallback: no current streaming message tracked, send standalone.
+            if let Err(error) = self
+                .shared
+                .telegram
+                .send_message(SendMessage::html(
+                    self.session_key.chat_id,
+                    thread_id,
+                    tool_html,
+                ))
+                .await
+            {
+                tracing::debug!("failed to send tool action message: {error:#}");
+            }
+        }
+    }
+
     async fn finish(&mut self, final_error: Option<String>) -> Result<()> {
-        if let Some(final_error) = final_error {
+        self.flush_tool_actions().await;
+        if let Some(ref final_error) = final_error {
             self.pending_text = if self.pending_text.trim().is_empty() {
-                final_error
+                final_error.clone()
             } else {
                 format!("{}\n\n{}", self.pending_text, final_error)
             };
+        }
+        // If the last message is just an empty phase placeholder with no real content,
+        // delete it instead of leaving a stale "⏳" message.
+        if !self.has_assistant_text && final_error.is_none() {
+            if let Some(msg) = self.messages.pop() {
+                let _ = self
+                    .shared
+                    .telegram
+                    .delete_message(msg.chat_id, msg.message_id)
+                    .await;
+            }
+            return Ok(());
         }
         self.flush(true).await
     }
@@ -600,6 +764,15 @@ impl LiveTurnSink {
     }
 }
 
+fn format_tool_actions_html(actions: &[String]) -> String {
+    let content = actions
+        .iter()
+        .map(|action| html_escape::encode_safe(action).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("<blockquote>{content}</blockquote>")
+}
+
 pub(super) fn truncate_for_live_update(text: &str, max_len: usize) -> String {
     if max_len == 0 {
         return String::new();
@@ -629,6 +802,23 @@ fn progress_status_text(text: &str) -> String {
         "⏳".to_string()
     } else {
         format!("⏳ {text}")
+    }
+}
+
+fn truncate_thinking_preview(text: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    let single_line = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .last()
+        .unwrap_or(text)
+        .trim();
+    if single_line.chars().count() <= MAX_CHARS {
+        single_line.to_string()
+    } else {
+        let truncated: String = single_line.chars().take(MAX_CHARS).collect();
+        format!("{truncated}…")
     }
 }
 
@@ -694,7 +884,12 @@ async fn enrich_audio_transcripts(
 
         match result {
             Ok(transcript) => {
+                let engine_label = transcript.engine.clone();
                 attachment.transcript = Some(transcript);
+                let done_label = format!("Transcribed audio {}/{total} via {engine_label}.", idx + 1);
+                if let Err(error) = sink.lock().await.set_progress(done_label).await {
+                    tracing::debug!("failed to update transcription done status: {error:#}");
+                }
             }
             Err(error) => {
                 tracing::warn!(
@@ -770,6 +965,16 @@ pub(super) fn prepare_runtime_request(
             .attachments
             .iter()
             .all(has_preferred_audio_transcript);
+
+    // Prepend the reply context so Codex knows which message the user is referring to.
+    if let Some(ref reply) = request.reply_context {
+        let context_note = if reply.is_from_bot {
+            format!("[The user is replying to your message: \"{}\"]", reply.text)
+        } else {
+            format!("[The user is referring to: \"{}\"]", reply.text)
+        };
+        user_prompt_sections.push(context_note);
+    }
 
     if !request.prompt.trim().is_empty() && !omit_default_attachment_prompt {
         user_prompt_sections.push(request.prompt.trim().to_string());
